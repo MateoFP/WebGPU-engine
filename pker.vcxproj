@@ -127,7 +127,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="game.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="renderer.cpp" />
+    <ClCompile Include="shader.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\font.h" />
+    <ClInclude Include="include\game.h" />
+    <ClInclude Include="include\mateo_math.h" />
+    <ClInclude Include="include\renderer.h" />
+    <ClInclude Include="include\stb_image.h" />
+    <ClInclude Include="include\tiny_obj_loader.h" />
+    <ClInclude Include="include\ufbx.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
