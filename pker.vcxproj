@@ -131,6 +131,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="renderer.cpp" />
     <ClCompile Include="shader.cpp" />
+    <ClCompile Include="ufbx.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\font.h" />

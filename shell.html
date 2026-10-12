@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>League of Legends 2</title>
+    <link rel="icon" type="image/x-icon" href="models/favicon.ico">
+    <style>
+        body { 
+            margin: 0; 
+            padding: 0; 
+            background-color: #222; 
+            overflow: hidden; 
+        }
+        canvas { 
+            width: 100vw; 
+            height: 100vh; 
+            display: block; 
+            outline: none;
+        }
+    </style>
+</head>
+<body>
+    <!-- The canvas our C++ code will draw to -->
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+
+    <script type='text/javascript'>
+        var Module = {
+            canvas: (function() {
+                var canvas = document.getElementById('canvas');
+                // Optional: handle context loss
+                canvas.addEventListener("webglcontextlost", function(e) { 
+                    alert('GPU context lost. Please reload.'); 
+                    e.preventDefault(); 
+                }, false);
+                return canvas;
+            })(),
+            // Suppress Emscripten's default print behavior to the DOM
+            print: function(text) { console.log(text); },
+            printErr: function(text) { console.error(text); }
+        };
+    </script>
+
+	{{{ SCRIPT }}}
+</body>
+</html>

@@ -2,11 +2,9 @@
 #include <webgpu/webgpu.h>
 #include <GLFW/glfw3.h>
 #include <iostream>
-#include <string_view>
 #include <vector> 
 #include "include/ufbx.h"
 #include "include/mateo_math.h"
-#include "game.h"
 
 #define WIDTH               1920
 #define HEIGHT              1080
@@ -17,6 +15,54 @@
 #define MAX_TEXTURES        20
 #define MAX_BONES           256
 
+struct BoundingBox
+{
+    v3 max;
+    v3 min;
+};
+struct Camera
+{
+    mat4 model;
+    mat4 view;
+    mat4 proj;
+    v3 pos;
+    v3 look_at;
+    float speed;
+};
+struct Ray
+{
+    v3 position;
+    v3 direction;
+};
+struct RayCollision
+{
+    bool hit;
+    float distance;
+    v3 point;
+    v3 normal;
+};
+struct ButtonState
+{
+    uint32_t half_transition_count;
+    bool ended_down;
+    bool pressed;
+};
+struct Input
+{
+    RayCollision collision = {};
+    Ray ray = {};
+    v2 mouse_pos = {};
+
+    union
+    {
+        ButtonState buttons[2];
+        struct
+        {
+            ButtonState spacebar;
+            ButtonState a;
+        };
+    };
+};
 struct Autos
 {
     v3 origin;
@@ -228,16 +274,39 @@ struct EngineContext
     double frame_delta = physics_dt;
     double last_time = 0.0;
 };
+struct GameContext
+{
+};
 
 extern EngineContext vk;
 extern WindowContext win;
+extern GameContext gc;
 extern GUBO gubo;
+extern Input input;
+extern Camera cam;
+extern Entity p1;
+extern Entity p2;
+extern BoundingBox world_box;
 extern const char* plane_shader;
 extern const char* object_shader;
 extern const char* ui_shader;
 extern const char* wire_shader;
 extern const char* outline_shader;
-extern Entity p1;
-extern Entity p2;
 
+void InitWorld();
 void InitVk();
+void UpdateGame(float delta);
+
+#ifdef __EMSCRIPTEN__
+extern "C"
+{
+    void JS_InitAudio();
+    void JS_LoadSound(const char* url_ptr, const char* name_ptr);
+    void JS_PlaySound(const char* name_ptr, float volume);
+    void JS_PlayMusic(const char* name_ptr, float volume);
+    bool JS_IsSoundLoaded(const char* name_ptr);
+}
+
+void FocusCanvas();
+void SetCursor(const char* path);
+#endif 

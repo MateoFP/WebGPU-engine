@@ -1,4 +1,3 @@
-#pragma once
 #define STB_IMAGE_IMPLEMENTATION 
 #define CGLTF_IMPLEMENTATION
 #include <GLFW/glfw3.h>
@@ -16,10 +15,519 @@
 #include "include/imgui/imgui.h"
 #include "include/stb_image.h"
 #include "include/renderer.h"
-#include "include/game.h"
 
 EngineContext vk = {};
 WindowContext win = {};
+GameContext gc = {};
+GUBO gubo = {};
+Input input = {};
+Camera cam = {};
+Entity p1 = {};
+Entity p2 = {};
+BoundingBox world_box = {};
+
+#ifdef __EMSCRIPTEN__
+EM_JS(void, JS_InitAudio, (),
+    {
+        window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        window.audioBuffers = {};
+    });
+EM_JS(void, JS_LoadSound, (const char* url_ptr, const char* name_ptr),
+    {
+        var url = UTF8ToString(url_ptr);
+        var name = UTF8ToString(name_ptr);
+
+        fetch(url)
+            .then(function(response)
+            {
+                return response.arrayBuffer();
+            })
+            .then(function(data)
+            {
+                return window.audioCtx.decodeAudioData(data);
+            })
+            .then(function(buffer)
+            {
+                window.audioBuffers[name] = buffer;
+                console.log("audio:", name);
+            })
+            .catch (function(err)
+            {
+                console.error("Audio load failed:", err);
+            });
+    });
+EM_JS(void, JS_PlaySound, (const char* name_ptr, float volume),
+    {
+        const name = UTF8ToString(name_ptr);
+        const buffer = window.audioBuffers[name];
+
+        if (!buffer)
+        {
+            console.warn("Sound not loaded yet:", name);
+            return;
+        }
+
+        if (window.audioCtx.state == 'suspended')
+        {
+            window.audioCtx.resume();
+        }
+
+        const source = window.audioCtx.createBufferSource();
+        source.buffer = buffer;
+
+        const gainNode = window.audioCtx.createGain();
+        gainNode.gain.value = volume;
+
+        source.connect(gainNode);
+        gainNode.connect(window.audioCtx.destination);
+
+        source.start(0);
+    });
+EM_JS(void, JS_PlayMusic, (const char* name_ptr, float volume),
+    {
+        var name = UTF8ToString(name_ptr);
+        var buffer = window.audioBuffers[name];
+        if (!buffer) return;
+
+        if (window.currentBgmSource)
+        {
+            try { window.currentBgmSource.stop(); }
+            catch (e) {}
+        }
+
+        if (window.audioCtx.state == 'suspended')
+        {
+            window.audioCtx.resume();
+        }
+
+        var source = window.audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+
+        var gainNode = window.audioCtx.createGain();
+        gainNode.gain.value = volume;
+        window.bgmGainNode = gainNode;
+
+        source.connect(gainNode);
+        gainNode.connect(window.audioCtx.destination);
+        source.start(0);
+
+        window.currentBgmSource = source;
+    });
+EM_JS(bool, JS_IsSoundLoaded, (const char* name_ptr),
+    {
+        var name = UTF8ToString(name_ptr);
+        return !!window.audioBuffers[name];
+    });
+void FocusCanvas()
+{
+    emscripten_run_script("document.getElementById('canvas').focus();");
+}
+void SetCursor(const char* path)
+{
+    EM_ASM(
+        {
+            var pathStr = UTF8ToString($0);
+            var x = $1;
+            var y = $2;
+            var canvas = Module['canvas'] || document.getElementById('canvas') || document.querySelector('canvas');
+            if (canvas)
+            {
+                canvas.style.cursor = 'url("' + pathStr + '") ' + x + ' ' + y + ', auto';
+            }
+            else
+            {
+                console.error("SetCursor: could not find HTML canvas element\n");
+            }
+        }, path, 0, 0);
+}
+#endif
+
+v3 RayCast(double xpos, double ypos, mat4 view, mat4 projection, float width, float height)
+{
+    if (view.element[0][0] == 0.0f)
+    {
+        printf("No valid view matrix.\n");
+        return { 0,0,0 };
+    }
+
+    float x = (2.0f * (float)xpos) / width - 1.0f;
+    float y = 1.0f - (2.0f * (float)ypos) / height;
+
+    v4 ray_clip = { x, y, 0.0f, 1.0f };
+
+    mat4 invProjMatrix = mat4_inv_perspective(projection);
+    v4 ray_eye = mat4_v4_linear_combine(ray_clip, invProjMatrix);
+
+    ray_eye.z = -1.0f;
+    ray_eye.w = 0.0f;
+
+    mat4 invViewMatrix = mat4_inv_lookat(view);
+    v4 inv_ray_wor = mat4_v4_linear_combine(ray_eye, invViewMatrix);
+
+    v3 ray_wor = { inv_ray_wor.x, inv_ray_wor.y, inv_ray_wor.z };
+    ray_wor = v3_normalize(ray_wor);
+
+    return ray_wor;
+}
+RayCollision GetRayCollisionBox(Ray ray, BoundingBox box)
+{
+    RayCollision collision = { 0 };
+
+    if (v3_dot(ray.direction, ray.direction) < 0.000001f)
+    {
+        printf("No valid ray.\n");
+        return collision = { 0 };
+    }
+
+    float inv_dx = 1.0f / ray.direction.x;
+    float inv_dy = 1.0f / ray.direction.y;
+    float inv_dz = 1.0f / ray.direction.z;
+
+    float t1 = (box.min.x - ray.position.x) * inv_dx;
+    float t2 = (box.max.x - ray.position.x) * inv_dx;
+    float t3 = (box.min.y - ray.position.y) * inv_dy;
+    float t4 = (box.max.y - ray.position.y) * inv_dy;
+    float t5 = (box.min.z - ray.position.z) * inv_dz;
+    float t6 = (box.max.z - ray.position.z) * inv_dz;
+
+    float tmin = fmaxf(fmaxf(fminf(t1, t2), fminf(t3, t4)), fminf(t5, t6));
+    float tmax = fminf(fminf(fmaxf(t1, t2), fmaxf(t3, t4)), fmaxf(t5, t6));
+
+    if (tmax < 0.0f || tmin > tmax)
+    {
+        collision.hit = false;
+        return collision;
+    }
+
+    collision.hit = true;
+
+    bool insideBox = (tmin < 0.0f);
+    if (insideBox)
+    {
+        collision.distance = tmax;
+    }
+    else
+    {
+        collision.distance = tmin;
+    }
+
+    collision.point = (ray.position + (collision.distance * ray.direction));
+
+    v3 box_center = v3_lerp(box.min, box.max, 0.5f);
+    v3 box_extents = box.max - box.min;
+
+    collision.normal = collision.point - box_center;
+    collision.normal *= 2.001f;
+    collision.normal = v3_divide(collision.normal, box_extents);
+
+    collision.normal.x = roundf(collision.normal.x);
+    collision.normal.y = roundf(collision.normal.y);
+    collision.normal.z = roundf(collision.normal.z);
+    collision.normal = v3_normalize(collision.normal);
+
+    if (insideBox)
+    {
+        collision.normal = -collision.normal;
+    }
+
+    return collision;
+}
+mat4 TSR(v3 translate, float scale, float angle)
+{
+    mat4 result = mat4_diagonal(1.0f);
+
+    mat4 scale_mat = mat4_scale({ scale, scale, scale });
+    mat4 rotate_mat = mat4_rotate_RH(angle, { 0.0f, 0.0f, 1.0f });
+    mat4 translate_mat = mat4_translate({ translate.x, translate.y, translate.z });
+
+    result = mat4_multiply(translate_mat, mat4_multiply(rotate_mat, scale_mat));
+
+    return result;
+}
+v2 WorldToScreen(v3 world_pos, mat4 view_proj)
+{
+    float clip_x = world_pos.x * view_proj.column[0].x + world_pos.y * view_proj.column[1].x + world_pos.z * view_proj.column[2].x + view_proj.column[3].x;
+    float clip_y = world_pos.x * view_proj.column[0].y + world_pos.y * view_proj.column[1].y + world_pos.z * view_proj.column[2].y + view_proj.column[3].y;
+    float clip_w = world_pos.x * view_proj.column[0].w + world_pos.y * view_proj.column[1].w + world_pos.z * view_proj.column[2].w + view_proj.column[3].w;
+
+    float ndc_x = clip_x / clip_w;
+    float ndc_y = clip_y / clip_w;
+
+    v2 position_2d;
+    position_2d.x = (ndc_x + 1.0f) * 0.5f * 1920.0f;
+    position_2d.y = (1.0f - ndc_y) * 0.5f * 1080.0f;
+
+    return position_2d;
+}
+void UpdateStatic()
+{
+    ModelMeshes& model = vk.model_meshes[1];
+    vk.model_meshes[1].active_instances = 42;
+
+    for (uint32_t i = 0; i < model.submesh_count; ++i)
+    {
+        vk.indirect_cmds[model.submesh_index + i].instance_count = model.active_instances;
+    }
+
+    ModelMeshes& model2 = vk.model_meshes[2];
+    vk.model_meshes[2].active_instances = 2;
+
+    for (uint32_t i = 0; i < model2.submesh_count; ++i)
+    {
+        vk.indirect_cmds[model2.submesh_index + i].instance_count = model2.active_instances;
+    }
+
+    size_t indirect_upload_size = sizeof(DrawIndexedIndirectCommand) * 100;
+    wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, 0, vk.indirect_cmds, indirect_upload_size);
+
+    vk.instance_data[0].matrix = TSR({ 0.0f, 0.0f, 0.0f }, 1.0f, 0.0f);
+    vk.instance_data[0].id = 1;
+    vk.instance_data[0].skinned = 0;
+    vk.instance_data[0].color = { 0.5f, 0.5f, 0.5f, 1.0f };
+    vk.instance_data[1].matrix = TSR({ 19.6461, 47.1684, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[2].matrix = TSR({ 1.58028, 27.5539, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[3].matrix = TSR({ 0.876242, 24.0858, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[4].matrix = TSR({ 2.7633, 21.7043, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[5].matrix = TSR({ 1.54829, 18.8526, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[6].matrix = TSR({ 2.56049, 16.1132, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[7].matrix = TSR({ 0.465165, 13.4252, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[8].matrix = TSR({ 13.8049, 0.872237, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[9].matrix = TSR({ 17.0794, 2.28585, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[10].matrix = TSR({ 20.7312, 0.548582, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[11].matrix = TSR({ 25.3496, 1.68974, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[12].matrix = TSR({ 29.5099, 1.06734, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[13].matrix = TSR({ 34.0692, 1.26314, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[14].matrix = TSR({ 38.3785, 0.774941, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[15].matrix = TSR({ 43.3268, 2.18606, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[16].matrix = TSR({ 44.5613, 1.00223, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[17].matrix = TSR({ 49.4174, 2.02013, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[18].matrix = TSR({ 41.7479, 1.19775, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[19].matrix = TSR({ 48.0504, 2.71727, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[20].matrix = TSR({ 47.2918, 0.80998, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[21].matrix = TSR({ 48.6042, 7.93406, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[22].matrix = TSR({ 46.2745, 6.78893, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[23].matrix = TSR({ 48.1731, 12.3996, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[24].matrix = TSR({ 48.4973, 17.2712, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[25].matrix = TSR({ 48.6649, 22.1225, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[26].matrix = TSR({ 47.1194, 25.3414, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[27].matrix = TSR({ 48.7091, 29.3777, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[28].matrix = TSR({ 48.6705, 35.184, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[29].matrix = TSR({ 0.760804, 31.4633, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[30].matrix = TSR({ 2.0965, 35.2207, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[31].matrix = TSR({ 0.841536, 39.2842, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[32].matrix = TSR({ 2.89485, 43.6928, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[33].matrix = TSR({ 1.44184, 48.3296, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[34].matrix = TSR({ 5.59274, 48.3067, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[35].matrix = TSR({ 9.56756, 49.1769, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[36].matrix = TSR({ 13.3267, 47.9841, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[37].matrix = TSR({ 17.6959, 48.8852, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[38].matrix = TSR({ 22.8705, 48.3067, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[39].matrix = TSR({ 27.6375, 48.8126, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[40].matrix = TSR({ 32.8059, 48.1631, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[41].matrix = TSR({ 37.5887, 49.1769, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[42].matrix = TSR({ 31.0865, 47.098, 0.0f }, 0.7f, 0.0f);
+    vk.instance_data[43].matrix = TSR({ 9.79052, 46.9576, 0.0f }, 0.7f, 0.0f);
+
+    for (uint32_t i = vk.model_meshes[1].base_instance; i < vk.model_meshes[1].active_instances + 2; i++)
+    {
+        vk.instance_data[i].id = 4;
+        vk.instance_data[i].skinned = 0;
+        vk.instance_data[i].color = {};
+    }
+
+    size_t instance_upload_size = sizeof(InstanceData) * 200;
+    wgpuQueueWriteBuffer(vk.queue, vk.instance_buffer.buffer, 0, vk.instance_data, instance_upload_size);
+}
+
+void WriteLargeBarEnemy(v3 pos, float height, float hp)
+{
+    uint32_t offset = vk.active_ui;
+
+    v2 bar = WorldToScreen({ pos.x, pos.y, pos.z + height }, gubo.projView);
+    bar.x -= 50.0f;
+    bar.y -= 45.0f;
+
+    vk.instance_data_ui[offset].uv = { 0.0f, 0.0f };
+    vk.instance_data_ui[offset].size = { 100.0f, 18.0f };
+    vk.instance_data_ui[offset].pos = { bar };
+
+    vk.instance_data_ui[offset + 1].uv = { 300.0f, 0.0f };
+    vk.instance_data_ui[offset + 1].size = { hp, 18.0f };
+    vk.instance_data_ui[offset + 1].pos = { bar };
+
+    vk.instance_data_ui[offset + 2].uv = { 200.0f, 0.0f };
+    vk.instance_data_ui[offset + 2].size = { 100.0f, 18.0f };
+    vk.instance_data_ui[offset + 2].pos = { bar };
+
+    vk.active_ui = vk.active_ui + 3;
+}
+void WriteLargeBar(v3 pos, float height, float hp)
+{
+    uint32_t offset = vk.active_ui;
+
+    v2 bar = WorldToScreen({ pos.x, pos.y, pos.z + height }, gubo.projView);
+    bar.x -= 50.0f;
+    bar.y -= 45.0f;
+
+    vk.instance_data_ui[offset].uv = { 0.0f, 0.0f };
+    vk.instance_data_ui[offset].size = { 100.0f, 18.0f };
+    vk.instance_data_ui[offset].pos = { bar };
+
+    vk.instance_data_ui[offset + 1].uv = { 100.0f, 0.0f };
+    vk.instance_data_ui[offset + 1].size = { hp, 18.0f };
+    vk.instance_data_ui[offset + 1].pos = { bar };
+
+    vk.instance_data_ui[offset + 2].uv = { 200.0f, 0.0f };
+    vk.instance_data_ui[offset + 2].size = { 100.0f, 18.0f };
+    vk.instance_data_ui[offset + 2].pos = { bar };
+
+    vk.active_ui = vk.active_ui + 3;
+}
+void WriteSmallBar(v3 pos, float height)
+{
+    uint32_t offset = vk.active_ui;
+
+    v2 bar = WorldToScreen({ pos.x, pos.y, pos.z + height }, gubo.projView);
+    bar.x -= 25.0f;
+    bar.y -= 45.0f;
+
+    vk.instance_data_ui[offset].uv = { 0.0f, 19.0f };
+    vk.instance_data_ui[offset].size = { 50.0f, 7.0f };
+    vk.instance_data_ui[offset].pos = { bar };
+
+    vk.instance_data_ui[offset + 1].uv = { 100.0f, 19.0f };
+    vk.instance_data_ui[offset + 1].size = { 50.0f, 7.0f };
+    vk.instance_data_ui[offset + 1].pos = { bar };
+
+    vk.active_ui = vk.active_ui + 2;
+}
+
+void UpdateGPU()
+{
+    cam.view = mat4_look_at(cam.pos, cam.look_at, { 0.0f, 0.0f, 1.0f });
+    gubo.projView = mat4_multiply(cam.proj, cam.view);
+    wgpuQueueWriteBuffer(vk.queue, vk.gubo_buffer.buffer, 0, &gubo, sizeof(gubo));
+
+    vk.instance_data[vk.model_meshes[2].base_instance].matrix = TSR({ p1.position.x, p1.position.y, 0.2f }, 1.0f, p1.angle);
+    vk.instance_data[vk.model_meshes[2].base_instance].id = 3;
+    vk.instance_data[vk.model_meshes[2].base_instance].skinned = 1;
+    vk.instance_data[vk.model_meshes[2].base_instance].bone_offset = 0;
+    vk.instance_data[vk.model_meshes[2].base_instance].color = { 0.0f, 0.0f, 0.0f , 1.0f };
+
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].matrix = TSR({ p2.position.x, p2.position.y, 0.2f }, 1.0f, p2.angle);
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].id = 3;
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].skinned = 1;
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].bone_offset = 33;
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].color = { 0.0f, 0.0f, 0.0f , 1.0f };
+
+    //vk.instance_data[vk.model_meshes[3].base_instance].matrix = TSR({ minion.position.x, minion.position.y, 0.0f }, 0.3f, 0.0f);
+    //vk.instance_data[vk.model_meshes[3].base_instance].id = 5;
+    //vk.instance_data[vk.model_meshes[3].base_instance].skinned = 1;
+    //vk.instance_data[vk.model_meshes[3].base_instance].bone_offset = 66;
+    //vk.instance_data[vk.model_meshes[3].base_instance].color = { 0.1f, 0.1f, 0.1f , 1.0f };
+
+    size_t start_index = vk.model_meshes[2].base_instance;
+    uint64_t gpu_byte_offset = start_index * sizeof(InstanceData);
+    size_t instance_upload_size = sizeof(InstanceData) * 2;
+    const void* cpu_data_pointer = &vk.instance_data[start_index];
+    wgpuQueueWriteBuffer(vk.queue, vk.instance_buffer.buffer, gpu_byte_offset, cpu_data_pointer, instance_upload_size);
+
+    vk.active_ui = 0;
+    //WriteSmallBar(minion.position, 1.0f);
+    WriteLargeBarEnemy(p2.position, 3.7f, p2.hp);
+    WriteLargeBar(p1.position, 3.7f, p1.hp);
+
+    //vk.instance_data_ui[vk.active_ui].uv = { 0.0f, 128.0f };
+    //vk.instance_data_ui[vk.active_ui].size = { 512.0f, 384.0f };
+    //vk.instance_data_ui[vk.active_ui].pos = { (win.extent_width / 2.0f) - 256.0f, (win.extent_height / 2.0f) - 192.0f };
+    //vk.active_ui = vk.active_ui + 1;
+
+    size_t ui_upload_size = sizeof(InstanceDataUI) * vk.active_ui;
+    wgpuQueueWriteBuffer(vk.queue, vk.instance_ui_buffer.buffer, 0, vk.instance_data_ui, ui_upload_size);
+
+    float offset = 1.5f;
+    float o_auto = 0.12f;
+
+    p1.bb.max = { p1.position.x + offset, p1.position.y + offset, p1.position.z + 2.7f };
+    p1.bb.min = { p1.position.x - offset, p1.position.y - offset, p1.position.z };
+
+    p2.bb.max = { p2.position.x + offset, p2.position.y + offset, p2.position.z + 2.7f };
+    p2.bb.min = { p2.position.x - offset, p2.position.y - offset, p2.position.z };
+
+    p1.autos.bb.min = { p1.autos.position.x + o_auto,  p1.autos.position.y + o_auto,  p1.autos.position.z + 4.2f };
+    p1.autos.bb.max = { p1.autos.position.x - o_auto,  p1.autos.position.y - o_auto,  p1.autos.position.z + 4.0f };
+
+    p2.autos.bb.min = { p2.autos.position.x + o_auto,  p2.autos.position.y + o_auto,  p2.autos.position.z + 4.2f };
+    p2.autos.bb.max = { p2.autos.position.x - o_auto,  p2.autos.position.y - o_auto,  p2.autos.position.z + 4.0f };
+
+    vk.instance_data_wire[0].max = { p1.autos.bb.max.x, p1.autos.bb.max.y, p1.autos.bb.max.z , 0.0f };
+    vk.instance_data_wire[0].min = { p1.autos.bb.min.x, p1.autos.bb.min.y, p1.autos.bb.min.z , 0.0f };
+    vk.instance_data_wire[0].color = { 1.0f, 0.0f, 0.0f, 1.0f };
+    vk.instance_data_wire[0].id = 0;
+
+    vk.instance_data_wire[1].max = { p2.autos.bb.max.x, p2.autos.bb.max.y, p2.autos.bb.max.z , 0.0f };
+    vk.instance_data_wire[1].min = { p2.autos.bb.min.x, p2.autos.bb.min.y, p2.autos.bb.min.z , 0.0f };
+    vk.instance_data_wire[1].color = { 1.0f, 0.0f, 0.0f, 1.0f };
+    vk.instance_data_wire[1].id = 0;
+
+    vk.instance_data_wire[2].max = { p1.bb.max.x, p1.bb.max.y, p1.bb.max.z };
+    vk.instance_data_wire[2].min = { p1.bb.min.x, p1.bb.min.y, p1.bb.min.z };
+    vk.instance_data_wire[2].color = { 1.0f, 0.0f, 0.0f, 1.0f };
+    vk.instance_data_wire[2].id = 0;
+
+    vk.instance_data_wire[3].max = { p2.bb.max.x, p2.bb.max.y, p2.bb.max.z };
+    vk.instance_data_wire[3].min = { p2.bb.min.x, p2.bb.min.y, p2.bb.min.z };
+    vk.instance_data_wire[3].color = { 1.0f, 0.0f, 0.0f, 1.0f };
+    vk.instance_data_wire[3].id = 0;
+
+    size_t bb_upload_size = sizeof(InstanceDataWire) * 4;
+    wgpuQueueWriteBuffer(vk.queue, vk.instance_wire_buffer.buffer, 0, vk.instance_data_wire, bb_upload_size);
+}
+void UpdateEntityAnimation(Entity* entity, float delta)
+{
+    entity->anim_time += (double)delta * entity->anim_speed;
+    ufbx_anim* current_anim = entity->model_mesh->animation[entity->current_anim_id];
+
+    if (current_anim)
+    {
+        double duration = current_anim->time_end - current_anim->time_begin;
+
+        if (entity->is_looping && duration > 0.0)
+        {
+            entity->anim_time = fmod(entity->anim_time, duration);
+        }
+        else if (entity->anim_time > duration)
+        {
+            entity->anim_time = duration;
+        }
+    }
+}
+void CheckAnimationEvents(Entity* entity, float delta)
+{
+    if (entity->anim_time < 0.1f)
+    {
+        entity->triggered_this_loop = false;
+    }
+
+    if ((!entity->triggered_this_loop) && (entity->anim_time >= entity->trigger_time) && (entity->current_anim_id == 3))
+    {
+        entity->autos.moving = true;
+#ifdef __EMSCRIPTEN__
+        JS_PlaySound("click", 0.015f);
+#endif
+        entity->triggered_this_loop = true;
+    }
+}
+void SetEntityAnimation(Entity* entity, uint32_t new_anim_id, bool loop)
+{
+    if (entity->current_anim_id != new_anim_id)
+    {
+        entity->current_anim_id = new_anim_id;
+        entity->anim_time = 0.0;
+        entity->is_looping = loop;
+    }
+}
 
 void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
@@ -74,8 +582,8 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
 }
 void CursorPosCallback(GLFWwindow* window, double x, double y)
 {
-    input.mouse_pos.x = clamp(x, 0.0f, win.extent_width - 20.0f);
-    input.mouse_pos.y = clamp(y, 0.0f, win.extent_height - 20.0f);
+    input.mouse_pos.x = clamp(x, 0.0f, win.extent_x - 20.0f);
+    input.mouse_pos.y = clamp(y, 0.0f, win.extent_y - 20.0f);
 }
 void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
 {
@@ -143,26 +651,6 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
 void FocusCallback(GLFWwindow* window, int focused)
 {
 }
-void SetCursor(const char* path)
-{
-#ifdef __EMSCRIPTEN__
-    EM_ASM(
-        {
-            var pathStr = UTF8ToString($0);
-            var x = $1;
-            var y = $2;
-            var canvas = Module['canvas'] || document.getElementById('canvas') || document.querySelector('canvas');
-            if (canvas)
-            {
-                canvas.style.cursor = 'url("' + pathStr + '") ' + x + ' ' + y + ', auto';
-            }
-            else
-            {
-                console.error("SetCursor: could not find HTML canvas element\n");
-            }
-        }, path, 0, 0);
-#endif
-}
 
 void ConfigSurface()
 {
@@ -191,8 +679,8 @@ void ConfigSurface()
     config.usage = WGPUTextureUsage_RenderAttachment;
     config.alphaMode = WGPUCompositeAlphaMode_Opaque;
     config.presentMode = WGPUPresentMode_Fifo;
-    config.width = win.x;
-    config.height = win.y;
+    config.width = win.extent_x;
+    config.height = win.extent_y;
     config.viewFormatCount = 0;
     config.viewFormats = nullptr;
 
@@ -389,22 +877,21 @@ void LoadTexture(const char* path, uint32_t tex_id)
 void LoadTextures()
 {
     uint32_t offset = 0;
-    LoadTexture("models/alphamask.png", offset);
+    LoadTexture("assets/alphamask.png", offset);
     offset++;
-    LoadTexture("models/brick.png", offset);
+    LoadTexture("assets/brick.png", offset);
     offset++;
-    LoadTexture("models/dirt.png", offset);
+    LoadTexture("assets/dirt.png", offset);
     offset++;
-    LoadTexture("models/player.png", offset);
+    LoadTexture("assets/player.png", offset);
     offset++;
-    LoadTexture("models/tree.png", offset);
+    LoadTexture("assets/tree.png", offset);
     offset++;
-    LoadTexture("models/stone_blue.png", offset);
+    LoadTexture("assets/stone_blue.png", offset);
     offset++;
-    LoadTexture("models/atlas_ui.png", offset);
+    LoadTexture("assets/atlas_ui.png", offset);
 }
-PipelineInfo CreatePipelineInfo(uint32_t opaque, uint32_t v_buffer_count,
-                                WGPUOptionalBool write, WGPUPrimitiveTopology topology,
+PipelineInfo CreatePipelineInfo(uint32_t opaque, uint32_t v_buffer_count, WGPUOptionalBool write, WGPUPrimitiveTopology topology,
                                 WGPUCompareFunction compare, WGPUCullMode cull_mode)
 {
     PipelineInfo result = {};
@@ -873,13 +1360,13 @@ void InitModel(const char* path, uint32_t max_instances, uint32_t offset)
 void InitModels()
 {
     uint32_t offset = 0;
-    InitModel("models/plane.fbx", 1, offset);
+    InitModel("assets/plane.fbx", 1, offset);
     offset += vk.model_meshes[0].max_instances;
-    InitModel("models/tree.fbx", 100, offset);
+    InitModel("assets/tree.fbx", 100, offset);
     offset += vk.model_meshes[1].max_instances;
-    InitModel("models/player.fbx", 2, offset);
+    InitModel("assets/player.fbx", 2, offset);
     offset += vk.model_meshes[2].max_instances;
-    InitModel("models/minion.fbx", 1, offset);
+    InitModel("assets/minion.fbx", 1, offset);
 }
 void GetBoneMatrices(Entity* player)
 {
@@ -919,6 +1406,122 @@ void GetBoneMatrices(Entity* player)
     ufbx_free_scene(eval);
 }
 
+void UpdatePositions()
+{
+    if ((p1.moving) && (v2_distance({ p1.position.x, p1.position.y },
+        { p1.destination.x, p1.destination.y }) > 0.1f))
+    {
+        p1.position += p1.movement;
+    }
+    else { p1.moving = false; }
+
+    if (!p1.autos.moving)
+    {
+        p1.autos.position = p1.position;
+    }
+    else
+    {
+        p1.autos.destination = p2.position;
+        p1.autos.movement.x = p1.autos.destination.x - p1.autos.position.x;
+        p1.autos.movement.y = p1.autos.destination.y - p1.autos.position.y;
+        p1.autos.movement = v3_normalize(p1.autos.movement);
+        p1.autos.movement *= p1.autos.speed;
+        p1.autos.position += p1.autos.movement;
+
+        if (v2_distance({ p1.autos.position.x, p1.autos.position.y }, { p2.position.x, p2.position.y }) <= 1.0f)
+        {
+            p1.autos.moving = false;
+            p1.autos.position = p1.position;
+            if (p2.hp != 0.0f)
+            {
+                p2.hp -= 5.0f;
+            }
+        }
+    }
+
+    if ((input.mouse_pos.x < 30) && (cam.pos.x > 5.0))
+    {
+        cam.pos.x -= cam.speed;
+        cam.look_at.x -= cam.speed;
+    }
+    else if ((input.mouse_pos.x > win.extent_x - 30.0f) && (cam.pos.x < 45.0f))
+    {
+        cam.pos.x += cam.speed;
+        cam.look_at.x += cam.speed;
+    }
+    if ((input.mouse_pos.y < 30) && (cam.pos.y < 30.0f))
+    {
+        cam.pos.y += cam.speed;
+        cam.look_at.y += cam.speed;
+    }
+    else if ((input.mouse_pos.y > win.extent_y - 30) && (cam.pos.y > -10.0f))
+    {
+        cam.pos.y -= cam.speed;
+        cam.look_at.y -= cam.speed;
+    }
+
+    if (input.spacebar.ended_down)
+    {
+        cam.pos = { p1.position.x, p1.position.y - 15.0f, 35.0f };
+        cam.look_at = { p1.position.x, p1.position.y + 1.0f, 1.0f };
+    }
+
+    input.ray.position = { cam.pos };
+}
+void UpdateEnemy()
+{
+    p2.destination = p1.position;
+    p2.movement.x = p2.destination.x - p2.position.x;
+    p2.movement.y = p2.destination.y - p2.position.y;
+    p2.movement = v3_normalize(p2.movement);
+    p2.movement *= p2.speed;
+
+    p2.angle = (atan2f(p2.movement.y, p2.movement.x)) + 1.5708;
+
+    if (p2.can_move)
+    {
+        if ((v2_distance({ p2.position.x, p2.position.y }, { p2.destination.x, p2.destination.y }) >= 10.0f))
+        {
+            p2.position += p2.movement;
+            p2.moving = true;
+            p2.in_range = false;
+        }
+        else
+        {
+            p2.moving = false;
+            p2.in_range = true;
+            p2.can_move = false;
+        }
+    }
+    else if ((v2_distance({ p2.position.x, p2.position.y }, { p2.destination.x, p2.destination.y }) >= 12.0f))
+    {
+        p2.can_move = true;
+    }
+
+    if (!p2.autos.moving)
+    {
+        p2.autos.position = p2.position;
+    }
+    else
+    {
+        p2.autos.destination = p1.position;
+        p2.autos.movement.x = p2.autos.destination.x - p2.autos.position.x;
+        p2.autos.movement.y = p2.autos.destination.y - p2.autos.position.y;
+        p2.autos.movement = v3_normalize(p2.autos.movement);
+        p2.autos.movement *= p2.autos.speed;
+        p2.autos.position += p2.autos.movement;
+
+        if (v2_distance({ p2.autos.position.x, p2.autos.position.y }, { p1.position.x, p1.position.y }) <= 1.0f)
+        {
+            p2.autos.moving = false;
+            p2.autos.position = p2.position;
+            if (p1.hp != 0.0f)
+            {
+                p1.hp -= 10.0f;
+            }
+        }
+    }
+}
 void Render()
 {
     //texture view
@@ -945,7 +1548,7 @@ void Render()
     color_attachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
 
     WGPURenderPassDepthStencilAttachment depth_attachment = {};
-    depth_attachment.view = vk.depth_view;
+    depth_attachment.view = vk.depth_image.view;
     depth_attachment.depthClearValue = 1.0f;
     depth_attachment.depthStoreOp = WGPUStoreOp_Store;
     depth_attachment.depthLoadOp = WGPULoadOp_Clear;
@@ -1004,6 +1607,46 @@ void Render()
     wgpuTextureRelease(surface_tex.texture);
 }
 
+void InitWorld()
+{
+    cam.model = mat4_diagonal(1.0f);
+    cam.proj = mat4_perspective(DegToRad(40.0f), (float)win.extent_x / (float)win.extent_y, 1.0f);
+    cam.pos = { 15.0f, 0.0f, 35.0f };
+    cam.look_at = { 15.0f, 16.0f, 1.0f };
+    cam.speed = 100.0f * vk.physics_dt;
+    world_box.min = { 0.0f, 0.0f, 0.0f };
+    world_box.max = { 50.0f, 50.0f, 0.0f };
+
+    p1 = {};
+    p1.position = { 15.0f, 15.0f, 0.0f };
+    p1.speed = 5.0f * vk.physics_dt;
+    p1.moving = false;
+    p1.model_mesh = &vk.model_meshes[2];
+    p1.instance_data.bone_offset = 0;
+    p1.current_anim_id = 1;
+    p1.autos = {};
+    p1.autos.origin = p1.position;
+    p1.autos.position = p1.position;;
+    p1.autos.speed = 30.0f * vk.physics_dt;
+
+    p2 = {};
+    p2.position = { 35.0f, 35.0f, 0.0f };
+    p2.speed = 4.5f * vk.physics_dt;
+    p2.moving = false;
+    p2.model_mesh = &vk.model_meshes[2];
+    p2.instance_data.bone_offset = 33;
+    p2.current_anim_id = 1;
+    p2.autos = {};
+    p2.autos.origin = p2.position;
+    p2.autos.position = p2.position;
+    p2.autos.speed = 30.0f * vk.physics_dt;
+
+    gubo = {};
+    gubo.window = { (float)win.extent_x, (float)win.extent_y };
+
+    input.mouse_pos.x = WIDTH / 2.0f;
+    input.mouse_pos.y = HEIGHT / 2.0f;
+}
 void InitVk()
 {
     //window 
@@ -1023,6 +1666,8 @@ void InitVk()
         return;
     }
     glfwGetFramebufferSize(win.handle, &win.extent_x, &win.extent_y);
+    win.x = WIDTH;
+    win.y = HEIGHT;
 
     glfwSetKeyCallback(win.handle, KeyCallback);
     glfwSetMouseButtonCallback(win.handle, MouseButtonCallback);
@@ -1034,7 +1679,6 @@ void InitVk()
         glfwSetInputMode(win.handle, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
     }
 
-    SetCursor("cursor.png");
     //instance
     vk.instance = wgpuCreateInstance(nullptr);
     if (vk.instance == nullptr)
@@ -1178,7 +1822,7 @@ void InitVk()
 
     //other stuff
     InitModels();
-    vk.tex_array = CreateTextureArray(512);
+    vk.tex_array.tex = CreateTextureArray(512);
     LoadTextures();
 
     WGPUBindGroupLayout bg_layout = CreateBindGroupsLayout();
@@ -1210,4 +1854,122 @@ void InitVk()
     vk.global_bg = CreateBindGroups(bg_layout);
 
     UpdateStatic();
+
+#ifdef __EMSCRIPTEN__
+    JS_InitAudio();
+    JS_LoadSound("fireball.mp3", "click");
+    SetCursor("cursor.png");
+#endif 
+}
+void UpdateGame(float delta)
+{
+    if (delta > 0.1f) delta = 0.1f;
+
+    vk.accumulator += delta;
+
+    while (vk.accumulator >= vk.physics_dt)
+    {
+        UpdatePositions();
+        UpdateEnemy();
+        vk.accumulator -= vk.physics_dt;
+    }
+
+    if (p1.moving)
+    {
+        SetEntityAnimation(&p1, 4, true);
+    }
+    else if (p1.current_anim_id != 4)
+    {
+        SetEntityAnimation(&p1, p1.current_anim_id, true);
+    }
+    else
+    {
+        SetEntityAnimation(&p1, 1, true);
+    }
+
+    if (p2.moving)
+    {
+        SetEntityAnimation(&p2, 4, true);
+    }
+    if (p2.in_range)
+    {
+        SetEntityAnimation(&p2, 3, true);
+    }
+
+    UpdateEntityAnimation(&p1, delta);
+    UpdateEntityAnimation(&p2, delta);
+
+    GetBoneMatrices(&p1);
+    GetBoneMatrices(&p2);
+
+    CheckAnimationEvents(&p1, delta);
+    CheckAnimationEvents(&p2, delta);
+
+    input.ray.direction = RayCast(input.mouse_pos.x, input.mouse_pos.y,
+        cam.view, cam.proj, (float)win.extent_x, (float)win.extent_y);
+    input.collision = GetRayCollisionBox(input.ray, p2.bb);
+    if (!input.collision.hit)
+    {
+        ModelMeshes model = vk.model_meshes[2];
+        if (vk.indirect_cmds[vk.active_commands].index_count != 0)
+        {
+            for (uint32_t i = 0; i < model.submesh_count; ++i)
+            {
+                DrawIndexedIndirectCommand cmd{};
+                vk.indirect_cmds[vk.active_commands + i] = cmd;
+            }
+
+            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
+            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
+            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset, &vk.indirect_cmds[vk.active_commands], instance_upload_size);
+
+#ifdef __EMSCRIPTEN__
+            SetCursor("cursor.png");
+#endif
+        }
+    }
+    else
+    {
+        vk.hovering = true;
+
+        if (vk.indirect_cmds[vk.active_commands].index_count == 0)
+        {
+            ModelMeshes model = vk.model_meshes[2];
+            for (uint32_t i = 0; i < model.submesh_count; ++i)
+            {
+                uint32_t index = model.submesh_index + i;
+
+                DrawIndexedIndirectCommand cmd{};
+                cmd.index_count = vk.meshes_alloc[index].index_count;
+                cmd.instance_count = 1;
+                cmd.first_index = vk.meshes_alloc[index].first_index;
+                cmd.vertex_offset = vk.meshes_alloc[index].vertex_offset;
+                cmd.first_instance = model.base_instance + 1;
+
+                vk.indirect_cmds[vk.active_commands + i] = cmd;
+            }
+
+            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
+            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
+            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset, &vk.indirect_cmds[vk.active_commands], instance_upload_size);
+
+#ifdef __EMSCRIPTEN__
+            SetCursor("cursor_red.png");
+#endif
+        }
+    }
+
+    UpdateGPU();
+    Render();
+
+    double work_end = glfwGetTime();
+    double true_cpu_ms = (work_end - vk.last_time) * 1000.0;
+
+    static double print_timer = 0.0;
+    print_timer += delta;
+    if (print_timer >= 1.0)
+    {
+        printf("%.2f ms\n", true_cpu_ms);
+        print_timer -= 1.0;
+    }
 }
