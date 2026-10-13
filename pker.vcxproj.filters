@@ -21,9 +21,6 @@
     <ClCompile Include="renderer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="game.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="shader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -48,9 +45,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\renderer.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="include\game.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

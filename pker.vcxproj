@@ -127,7 +127,6 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="game.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="renderer.cpp" />
     <ClCompile Include="shader.cpp" />
@@ -135,7 +134,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\font.h" />
-    <ClInclude Include="include\game.h" />
     <ClInclude Include="include\mateo_math.h" />
     <ClInclude Include="include\renderer.h" />
     <ClInclude Include="include\stb_image.h" />

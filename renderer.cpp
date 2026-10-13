@@ -438,10 +438,10 @@ void UpdateGPU()
     WriteLargeBarEnemy(p2.position, 3.7f, p2.hp);
     WriteLargeBar(p1.position, 3.7f, p1.hp);
 
-    //vk.instance_data_ui[vk.active_ui].uv = { 0.0f, 128.0f };
-    //vk.instance_data_ui[vk.active_ui].size = { 512.0f, 384.0f };
-    //vk.instance_data_ui[vk.active_ui].pos = { (win.extent_width / 2.0f) - 256.0f, (win.extent_height / 2.0f) - 192.0f };
-    //vk.active_ui = vk.active_ui + 1;
+    vk.instance_data_ui[vk.active_ui].uv = { 0.0f, 128.0f };
+    vk.instance_data_ui[vk.active_ui].size = { 512.0f, 384.0f };
+    vk.instance_data_ui[vk.active_ui].pos = { 0.0f, 0.0f };
+    vk.active_ui = vk.active_ui + 1;
 
     size_t ui_upload_size = sizeof(InstanceDataUI) * vk.active_ui;
     wgpuQueueWriteBuffer(vk.queue, vk.instance_ui_buffer.buffer, 0, vk.instance_data_ui, ui_upload_size);
@@ -530,9 +530,10 @@ void SetEntityAnimation(Entity* entity, uint32_t new_anim_id, bool loop)
 }
 
 void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
-{
+{   
     switch (key)
     {
+        
         case GLFW_KEY_Q: 
         {
 
