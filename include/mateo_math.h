@@ -222,7 +222,15 @@ inline v3 v3_cross(v3 left, v3 right)
 }
 inline v3 v3_normalize(v3 vector)
 {
-	return (InvSqrtF(v3_dot(vector, vector)) * vector);
+    constexpr float min_length_squared = 1e-12f; // Length: 1e-6
+    const float length_squared = v3_dot(vector, vector);
+
+    if (length_squared <= min_length_squared)
+    {
+        return {};
+    }
+
+    return (1.0f / sqrtf(length_squared)) * vector;
 }
 inline v3 v3_lerp(v3 left, v3 right, float amount)
 {
