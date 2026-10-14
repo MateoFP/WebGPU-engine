@@ -6,13 +6,25 @@
 
 void MainLoop()
 {
-    double current_time = glfwGetTime();
-    vk.frame_delta = current_time - vk.last_time;
-    vk.last_time = current_time;
-    gubo.time += vk.frame_delta;
+#ifdef __EMSCRIPTEN__
+    static double timer = 0.0;
+    timer += vk.frame_delta;
+    if ((timer >= 2.0) && (!web.Connected))
+    {
+        JS_ConnectToServer();
+        timer -= 2.0;
+    }
 
-    glfwPollEvents();
-    UpdateGame(vk.frame_delta);
+#endif
+    if (!gc.paused)
+    {
+        double current_time = glfwGetTime();
+        vk.frame_delta = current_time - vk.last_time;
+        vk.last_time = current_time;
+        gubo.time += vk.frame_delta;
+        glfwPollEvents();
+        UpdateGame(vk.frame_delta);
+    }
 }
 
 int main()
@@ -23,7 +35,7 @@ int main()
     printf("world initialized.\n");
 
     vk.last_time = glfwGetTime();
-
+    UpdateGame(vk.physics_dt);
 #ifdef __EMSCRIPTEN__
     FocusCanvas();
     emscripten_set_main_loop(MainLoop, 0, 1);

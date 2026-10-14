@@ -12,7 +12,6 @@
 #endif
 #include "include/mateo_math.h"
 #include "include/font.h"
-#include "include/imgui/imgui.h"
 #include "include/stb_image.h"
 #include "include/renderer.h"
 
@@ -27,6 +26,94 @@ Entity p2 = {};
 BoundingBox world_box = {};
 
 #ifdef __EMSCRIPTEN__
+
+WebContext web = {};
+
+extern "C" 
+{
+    EMSCRIPTEN_KEEPALIVE
+        void StartLobby()
+    {
+        gc.paused = false;
+    }
+
+    EM_JS(void, JS_StartLobby, (),
+        {
+            document.getElementById("lobby-ui").style.display = "none";
+            _StartLobby();
+        });
+
+    EM_JS(void, JS_ShowLobbyLink, (const char* code_ptr),
+        {
+            const code = UTF8ToString(code_ptr);
+
+            document.getElementById("generator-section").style.display = "none";
+            document.getElementById("link-section").style.display = "block";
+
+            const input = document.getElementById("invite-link-input");
+            input.value = "pker.io/?code=" + code;
+        });
+
+    EMSCRIPTEN_KEEPALIVE
+    void FocusCanvas()
+    {
+        emscripten_run_script("document.getElementById('canvas').focus();");
+    }
+    EMSCRIPTEN_KEEPALIVE
+    void SetCursor(const char* path)
+    {
+        EM_ASM(
+            {
+                var pathStr = UTF8ToString($0);
+                var x = $1;
+                var y = $2;
+                var canvas = Module['canvas'] || document.getElementById('canvas') || document.querySelector('canvas');
+                if (canvas)
+                {
+                    canvas.style.cursor = 'url("' + pathStr + '") ' + x + ' ' + y + ', auto';
+                }
+                else
+                {
+                    console.error("SetCursor: could not find HTML canvas element\n");
+                }
+            }, path, 0, 0);
+    }
+    EMSCRIPTEN_KEEPALIVE
+    void OnEstablishedConnection()
+    {
+        web.Connected = true;
+    }
+    EMSCRIPTEN_KEEPALIVE
+    void OnLostConnection()
+    {
+        web.Connected = false;
+    }
+    EMSCRIPTEN_KEEPALIVE
+    void OnReceiveServerPacket(uint8_t* data, size_t byte_length)
+    {
+        if (byte_length == 0) return;
+
+        uint8_t opcode = data[0];
+
+        switch (opcode)
+        {
+            case 2:
+            {
+                std::string lobby_code(reinterpret_cast<char*>(data + 1), byte_length - 1);
+                JS_ShowLobbyLink(lobby_code.c_str());
+            } break;
+            case 3:
+            {
+                JS_StartLobby();
+            }
+            default:
+            {
+            } break;
+        }
+        printf("Receieved packet\n");
+    }
+}
+
 EM_JS(void, JS_InitAudio, (),
     {
         window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -84,7 +171,7 @@ EM_JS(void, JS_PlaySound, (const char* name_ptr, float volume),
         source.start(0);
     });
 EM_JS(void, JS_PlayMusic, (const char* name_ptr, float volume),
-    {
+{
         var name = UTF8ToString(name_ptr);
         var buffer = window.audioBuffers[name];
         if (!buffer) return;
@@ -113,34 +200,98 @@ EM_JS(void, JS_PlayMusic, (const char* name_ptr, float volume),
         source.start(0);
 
         window.currentBgmSource = source;
-    });
+});
 EM_JS(bool, JS_IsSoundLoaded, (const char* name_ptr),
-    {
+{
         var name = UTF8ToString(name_ptr);
         return !!window.audioBuffers[name];
-    });
-void FocusCanvas()
+});
+EM_JS(void, JS_ConnectToServer, (), 
 {
-    emscripten_run_script("document.getElementById('canvas').focus();");
-}
-void SetCursor(const char* path)
-{
-    EM_ASM(
+    console.log("Connecting to server.");
+
+    globalThis.pkerSocket = new WebSocket("ws://localhost:9001", "tcp-protocol");
+    globalThis.pkerSocket.binaryType = "arraybuffer";
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const targetCode = urlParams.get('code');
+
+    globalThis.pkerSocket.onopen = () => 
+    {
+        console.log("Connected to OCI server!");
+
+        if (!targetCode)
         {
-            var pathStr = UTF8ToString($0);
-            var x = $1;
-            var y = $2;
-            var canvas = Module['canvas'] || document.getElementById('canvas') || document.querySelector('canvas');
-            if (canvas)
+            document.getElementById("generator-section").style.display = "block";
+            document.getElementById("connecting-section").style.display = "none";
+        }
+        else
+        {
+            document.getElementById("invite-link-input").style.display = "none";
+            document.getElementById("copy-btn").style.display = "none";
+            document.getElementById("generator-section").style.display = "none";
+
+            const encoder = new TextEncoder();
+            const codeBytes = encoder.encode(targetCode);
+
+            if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN)
             {
-                canvas.style.cursor = 'url("' + pathStr + '") ' + x + ' ' + y + ', auto';
+                const packet = new Uint8Array(1 + codeBytes.length);
+                packet[0] = 2;
+                packet.set(codeBytes, 1);
+
+                globalThis.pkerSocket.send(packet);
+                console.log("Sent Lobby Code.\n");
             }
-            else
-            {
-                console.error("SetCursor: could not find HTML canvas element\n");
-            }
-        }, path, 0, 0);
-}
+        }
+
+        _OnEstablishedConnection();
+    };
+
+    globalThis.pkerSocket.onmessage = (event) => 
+    {
+        const sourceArray = new Uint8Array(event.data);
+        const bufferPtr = _malloc(sourceArray.byteLength);
+        HEAPU8.set(sourceArray, bufferPtr);
+        _OnReceiveServerPacket(bufferPtr, sourceArray.byteLength);
+        _free(bufferPtr);
+    };
+
+    globalThis.pkerSocket.onclose = (event) => 
+    {
+        console.warn("Connection closed. Code:", event.code, "Reason:", event.reason);
+        _OnLostConnection(); 
+    };
+
+    globalThis.pkerSocket.onerror = (error) => 
+    {
+        console.error("WebSocket error encountered:", error);
+        _OnLostConnection();
+    };
+
+    document.getElementById("copy-btn").onclick = () => {
+        const input = document.getElementById("invite-link-input");
+        const copyBtn = document.getElementById("copy-btn");
+
+        navigator.clipboard.writeText(input.value).then(() => {
+            copyBtn.innerText = "Copied";
+            copyBtn.disabled = true;
+        });
+    };
+
+    document.getElementById("generate-btn").onclick = () => 
+    {
+        document.getElementById("generate-btn").innerText = "Creating...";
+        document.getElementById("generate-btn").disabled = true;
+
+        if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN) 
+        {
+            const packet = new Uint8Array([1]); 
+            globalThis.pkerSocket.send(packet);
+        }
+    };
+
+});
 #endif
 
 v3 RayCast(double xpos, double ypos, mat4 view, mat4 projection, float width, float height)
@@ -437,11 +588,6 @@ void UpdateGPU()
     //WriteSmallBar(minion.position, 1.0f);
     WriteLargeBarEnemy(p2.position, 3.7f, p2.hp);
     WriteLargeBar(p1.position, 3.7f, p1.hp);
-
-    vk.instance_data_ui[vk.active_ui].uv = { 0.0f, 128.0f };
-    vk.instance_data_ui[vk.active_ui].size = { 512.0f, 384.0f };
-    vk.instance_data_ui[vk.active_ui].pos = { 0.0f, 0.0f };
-    vk.active_ui = vk.active_ui + 1;
 
     size_t ui_upload_size = sizeof(InstanceDataUI) * vk.active_ui;
     wgpuQueueWriteBuffer(vk.queue, vk.instance_ui_buffer.buffer, 0, vk.instance_data_ui, ui_upload_size);

@@ -276,6 +276,7 @@ struct EngineContext
 };
 struct GameContext
 {
+    bool paused = true;
 };
 
 extern EngineContext vk;
@@ -298,6 +299,14 @@ void InitVk();
 void UpdateGame(float delta);
 
 #ifdef __EMSCRIPTEN__
+
+struct WebContext
+{
+    bool Connected;
+};
+
+extern WebContext web;
+
 extern "C"
 {
     void JS_InitAudio();
@@ -305,8 +314,16 @@ extern "C"
     void JS_PlaySound(const char* name_ptr, float volume);
     void JS_PlayMusic(const char* name_ptr, float volume);
     bool JS_IsSoundLoaded(const char* name_ptr);
-}
+    void JS_ConnectToServer();
+    void JS_ShowLobbyLink(const char* code_ptr);
+    void JS_StartLobby();
 
 void FocusCanvas();
 void SetCursor(const char* path);
+void OnEstablishedConnection();
+void OnLostConnection();
+void OnReceiveServerPacket(uint8_t* data, size_t byte_length);
+void StartLobby();
+}
+
 #endif 
