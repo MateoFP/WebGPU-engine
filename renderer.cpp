@@ -15,55 +15,152 @@
 #include "include/stb_image.h"
 #include "include/renderer.h"
 
+enum ActionKeys : uint8_t
+{
+    KEY_A = 1,
+    KEY_S = 2,
+    MBR = 3,
+    MBL = 4,
+};
+enum KeyFlags : uint8_t
+{
+    PRESSED = 1,
+    RELEASED = 2,
+};
+enum StatusFlags : uint32_t
+{
+    IS_DEAD = 1 << 0, // Bit 0
+    IS_MOVING = 1 << 1, // Bit 1
+    IS_CASTING = 1 << 2, // Bit 2
+    IS_ROOTED = 1 << 3, // Bit 3
+};
+enum in_opcode : uint8_t
+{
+    PONG = 50,
+    LOBBY_DESTROYED = 51,
+    LOBBY_CODE = 52,
+    START_LOBBY = 53,
+    NO_LOBBY_FOUND = 54,
+    SERVER_STATE = 55,
+};
+enum out_opcode : uint8_t
+{
+    PING = 10,
+    CREATE_CLIENT = 11,
+    FIND_LOBBY = 12,
+    PLAYER_INPUT = 13,
+};
+
 EngineContext vk = {};
 WindowContext win = {};
 GameContext gc = {};
 GUBO gubo = {};
 Input input = {};
 Camera cam = {};
-Entity p1 = {};
-Entity p2 = {};
+Entity player[2] = {};
 BoundingBox world_box = {};
 
+WebContext web = {};
 #ifdef __EMSCRIPTEN__
 
-WebContext web = {};
+ServerPlayerState player_states[2];
 
-extern "C" 
+EM_JS(void, JS_ShowLobbyLink, (const char* code_ptr),
+    {
+        const code = UTF8ToString(code_ptr);
+
+        document.getElementById("generator-section").style.display = "none";
+        document.getElementById("link-section").style.display = "block";
+
+        const input = document.getElementById("invite-link-input");
+        input.value = "https://pker.io/?code=" + code;
+    });
+
+EM_JS(void, JS_StartLobby, (),
+    {
+        const lobbyUi = document.getElementById("lobby-ui");
+        if (lobbyUi) 
+        {
+            lobbyUi.style.display = "none";
+        }
+        _StartLobby();
+    });
+
+EM_JS(void, JS_CloseSocket, (),
+    {
+        document.getElementById("invite-link-input").style.display = "none";
+        document.getElementById("copy-btn").style.display = "none";
+        document.getElementById("generator-section").style.display = "none";
+        if (globalThis.pkerSocket) 
+        {
+            globalThis.pkerSocket.close(1000, "Lobby destroyed.");
+            globalThis.pkerSocket = null;
+        }
+        window.history.replaceState({}, document.title, window.location.pathname);
+    });
+
+extern "C"
 {
+    EMSCRIPTEN_KEEPALIVE
+        void SetLocalID(uint8_t local_id)
+    {
+        web.local_id = local_id;
+
+        if (local_id == 0)
+        {
+            web.enemy_id = 1;
+        }
+        else
+        {
+            web.enemy_id = 0;
+        }
+    }
+
     EMSCRIPTEN_KEEPALIVE
         void StartLobby()
     {
         gc.paused = false;
     }
 
-    EM_JS(void, JS_StartLobby, (),
+    EMSCRIPTEN_KEEPALIVE
+        void ProcessServerState(uint8_t* data, size_t len)
+    {
+        if (len < sizeof(WorldStateHeader)) return;
+        size_t offset = 0;
+
+        WorldStateHeader header;
+        std::memcpy(&header, data + offset, sizeof(WorldStateHeader));
+        offset += sizeof(WorldStateHeader);
+
+        for (int i = 0; i < header.player_count; i++)
         {
-            document.getElementById("lobby-ui").style.display = "none";
-            _StartLobby();
-        });
+            if (offset + sizeof(ServerPlayerState) > len) break;
 
-    EM_JS(void, JS_ShowLobbyLink, (const char* code_ptr),
-        {
-            const code = UTF8ToString(code_ptr);
+            ServerPlayerState player_state;
+            std::memcpy(&player_state, data + offset, sizeof(ServerPlayerState));
+            offset += sizeof(ServerPlayerState);
 
-            document.getElementById("generator-section").style.display = "none";
-            document.getElementById("link-section").style.display = "block";
+            player_states[player_state.player_id].x = player_state.x;
+            player_states[player_state.player_id].y = player_state.y;
+            player_states[player_state.player_id].dx = player_state.dx;
+            player_states[player_state.player_id].dy = player_state.dy;
+            player_states[player_state.player_id].hp = player_state.hp;
+            player_states[player_state.player_id].status_flags = player_state.status_flags;
+            // g_client_players[player_state.player_id].last_server_tick = header.server_tick;
 
-            const input = document.getElementById("invite-link-input");
-            input.value = "pker.io/?code=" + code;
-        });
+        }
+    }
 
     EMSCRIPTEN_KEEPALIVE
-    void FocusCanvas()
+        void FocusCanvas()
     {
         emscripten_run_script("document.getElementById('canvas').focus();");
     }
+
     EMSCRIPTEN_KEEPALIVE
-    void SetCursor(const char* path)
+        void SetCursor(const char* path)
     {
-        EM_ASM(
-            {
+        EM_ASM({
                 var pathStr = UTF8ToString($0);
                 var x = $1;
                 var y = $2;
@@ -75,21 +172,24 @@ extern "C"
                 else
                 {
                     console.error("SetCursor: could not find HTML canvas element\n");
-                }
-            }, path, 0, 0);
+            } }, path, 0, 0);
     }
+
     EMSCRIPTEN_KEEPALIVE
-    void OnEstablishedConnection()
+        void OnEstablishedConnection()
     {
         web.Connected = true;
     }
+
     EMSCRIPTEN_KEEPALIVE
-    void OnLostConnection()
+        void OnLostConnection()
     {
         web.Connected = false;
+        gc.paused = true;
     }
+
     EMSCRIPTEN_KEEPALIVE
-    void OnReceiveServerPacket(uint8_t* data, size_t byte_length)
+        void OnReceiveServerPacket(uint8_t* data, size_t byte_length)
     {
         if (byte_length == 0) return;
 
@@ -97,27 +197,55 @@ extern "C"
 
         switch (opcode)
         {
-            case 2:
+            case PONG:
+            {
+                if (byte_length >= sizeof(9)) //PingPacket is 9 
+                {
+                    double sent_timestamp;
+                    std::memcpy(&sent_timestamp, data + 1, sizeof(double));
+
+                    double now = glfwGetTime();
+                    double difference = now - sent_timestamp;
+                    web.ping = difference * 1000.0;
+                    printf("web.ping = %.2f\n", web.ping);
+                }
+            } break;
+            case LOBBY_CODE:
             {
                 std::string lobby_code(reinterpret_cast<char*>(data + 1), byte_length - 1);
                 JS_ShowLobbyLink(lobby_code.c_str());
             } break;
-            case 3:
+            case START_LOBBY:
             {
                 JS_StartLobby();
-            }
+            } break;
+            case SERVER_STATE:
+            {
+                ProcessServerState(data, byte_length);
+            } break;
+            case LOBBY_DESTROYED:
+            {
+                JS_CloseSocket();
+            } break;
             default:
             {
             } break;
         }
-        printf("Receieved packet\n");
     }
 }
-
 EM_JS(void, JS_InitAudio, (),
     {
         window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         window.audioBuffers = {};
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+
+        gainNode.gain.value = 0.00001; 
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
     });
 EM_JS(void, JS_LoadSound, (const char* url_ptr, const char* name_ptr),
     {
@@ -208,9 +336,13 @@ EM_JS(bool, JS_IsSoundLoaded, (const char* name_ptr),
 });
 EM_JS(void, JS_ConnectToServer, (), 
 {
-    console.log("Connecting to server.");
+    if (globalThis.pkerSocket && (globalThis.pkerSocket.readyState == WebSocket.CONNECTING || globalThis.pkerSocket.readyState == WebSocket.OPEN))
+    {
+        return;
+    }
 
-    globalThis.pkerSocket = new WebSocket("ws://localhost:9001", "tcp-protocol");
+    console.log("Connecting to server.");
+    globalThis.pkerSocket = new WebSocket("wss://game.pker.io:8443", "tcp-protocol");
     globalThis.pkerSocket.binaryType = "arraybuffer";
 
     const urlParams = new URLSearchParams(window.location.search);
@@ -224,9 +356,13 @@ EM_JS(void, JS_ConnectToServer, (),
         {
             document.getElementById("generator-section").style.display = "block";
             document.getElementById("connecting-section").style.display = "none";
+
+            _SetLocalID(0);
         }
         else
         {
+            _SetLocalID(1);
+
             document.getElementById("invite-link-input").style.display = "none";
             document.getElementById("copy-btn").style.display = "none";
             document.getElementById("generator-section").style.display = "none";
@@ -236,8 +372,9 @@ EM_JS(void, JS_ConnectToServer, (),
 
             if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN)
             {
+                const FIND_LOBBY = 12;
                 const packet = new Uint8Array(1 + codeBytes.length);
-                packet[0] = 2;
+                packet[0] = FIND_LOBBY;
                 packet.set(codeBytes, 1);
 
                 globalThis.pkerSocket.send(packet);
@@ -260,38 +397,139 @@ EM_JS(void, JS_ConnectToServer, (),
     globalThis.pkerSocket.onclose = (event) => 
     {
         console.warn("Connection closed. Code:", event.code, "Reason:", event.reason);
+
+        const connectingSec = document.getElementById("connecting-section");
+        const statusText = document.getElementById("connecting-status");
+        const genSec = document.getElementById("generator-section");
+        const lobbyUi = document.getElementById("lobby-ui");
+
+        if (connectingSec) 
+        {
+            connectingSec.style.display = "block";
+        }
+        if (statusText) 
+        {
+            statusText.innerText = "Disconnected from server. Ctrl + R to reload.";
+        }
+        if (genSec) 
+        {
+            genSec.style.display = "none";
+        }
+        if (lobbyUi) 
+        {
+            lobbyUi.style.display = "block"; 
+        }
+
         _OnLostConnection(); 
+        JS_CloseSocket();
     };
 
     globalThis.pkerSocket.onerror = (error) => 
     {
         console.error("WebSocket error encountered:", error);
-        _OnLostConnection();
     };
-
-    document.getElementById("copy-btn").onclick = () => {
-        const input = document.getElementById("invite-link-input");
-        const copyBtn = document.getElementById("copy-btn");
-
-        navigator.clipboard.writeText(input.value).then(() => {
-            copyBtn.innerText = "Copied";
-            copyBtn.disabled = true;
-        });
-    };
-
-    document.getElementById("generate-btn").onclick = () => 
-    {
-        document.getElementById("generate-btn").innerText = "Creating...";
-        document.getElementById("generate-btn").disabled = true;
-
-        if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN) 
-        {
-            const packet = new Uint8Array([1]); 
-            globalThis.pkerSocket.send(packet);
-        }
-    };
-
 });
+EM_JS(void, JS_SendInput, (float x, float y, uint8_t action_key, uint8_t key_flags, uint8_t target_id),
+    {
+        const PLAYER_INPUT = 13;
+        if (!globalThis.input_buffer)
+        {
+            globalThis.input_buffer = new ArrayBuffer(12);
+            globalThis.input_view = new DataView(globalThis.input_buffer);
+            globalThis.input_view.setUint8(0, PLAYER_INPUT);
+        }
+
+        globalThis.input_view.setFloat32(1, x, true);
+        globalThis.input_view.setFloat32(5, y, true);
+        globalThis.input_view.setUint8(9, action_key);
+        globalThis.input_view.setUint8(10, key_flags);
+        globalThis.input_view.setUint8(11, target_id);
+
+        if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN)
+        {
+            globalThis.pkerSocket.send(globalThis.input_buffer);
+        }
+    });
+EM_JS(void, JS_Ping, (double current_time),
+    {
+        const PING = 10;
+
+        if (!globalThis.ping_buffer) 
+        {
+            globalThis.ping_buffer = new ArrayBuffer(9);
+            globalThis.ping_view = new DataView(globalThis.ping_buffer);
+            globalThis.ping_view.setUint8(0, PING);
+        }
+
+        globalThis.ping_view.setFloat64(1, current_time, true);
+
+        if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN)
+        {
+            globalThis.pkerSocket.send(globalThis.ping_buffer);
+        }
+    });
+
+EM_JS(void, JS_InitPage, (),
+    {
+        const copyBtn = document.getElementById("copy-btn");
+        if (copyBtn) 
+        {
+            copyBtn.onclick = () => 
+            {
+                const input = document.getElementById("invite-link-input");
+                navigator.clipboard.writeText(input.value).then(() => 
+                {
+                    copyBtn.innerText = "Copied";
+                    copyBtn.disabled = true;
+                });
+            };
+        }
+
+        const genBtn = document.getElementById("generate-btn");
+        if (genBtn) 
+        {
+            genBtn.onclick = () => 
+            {
+                genBtn.innerText = "Creating...";
+                genBtn.disabled = true;
+
+                if (globalThis.pkerSocket && globalThis.pkerSocket.readyState == WebSocket.OPEN) 
+                {
+                    const CREATE_CLIENT = 11;
+                    const packet = new Uint8Array([CREATE_CLIENT]);
+                    globalThis.pkerSocket.send(packet);
+                }
+            };
+        }
+
+        const canvas = document.getElementById('canvas');
+        if (canvas)
+        {
+            canvas.onclick = () =>
+            {
+                if (window.audioCtx && window.audioCtx.state == 'suspended')
+                {
+                    window.audioCtx.resume();
+                }
+                canvas.onclick = null;
+            };
+        }
+
+        document.addEventListener("visibilitychange", function()
+        {
+            if (typeof _PauseGame == 'function')
+            {
+                if (document.hidden)
+                {
+                    _PauseGame(1);
+                }
+                else
+                {
+                    _PauseGame(0);
+                }
+            }
+        });
+    });
 #endif
 
 v3 RayCast(double xpos, double ypos, mat4 view, mat4 projection, float width, float height)
@@ -413,14 +651,6 @@ v2 WorldToScreen(v3 world_pos, mat4 view_proj)
 }
 void UpdateStatic()
 {
-    ModelMeshes& model = vk.model_meshes[1];
-    vk.model_meshes[1].active_instances = 42;
-
-    for (uint32_t i = 0; i < model.submesh_count; ++i)
-    {
-        vk.indirect_cmds[model.submesh_index + i].instance_count = model.active_instances;
-    }
-
     ModelMeshes& model2 = vk.model_meshes[2];
     vk.model_meshes[2].active_instances = 2;
 
@@ -436,58 +666,8 @@ void UpdateStatic()
     vk.instance_data[0].id = 1;
     vk.instance_data[0].skinned = 0;
     vk.instance_data[0].color = { 0.5f, 0.5f, 0.5f, 1.0f };
-    vk.instance_data[1].matrix = TSR({ 19.6461, 47.1684, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[2].matrix = TSR({ 1.58028, 27.5539, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[3].matrix = TSR({ 0.876242, 24.0858, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[4].matrix = TSR({ 2.7633, 21.7043, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[5].matrix = TSR({ 1.54829, 18.8526, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[6].matrix = TSR({ 2.56049, 16.1132, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[7].matrix = TSR({ 0.465165, 13.4252, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[8].matrix = TSR({ 13.8049, 0.872237, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[9].matrix = TSR({ 17.0794, 2.28585, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[10].matrix = TSR({ 20.7312, 0.548582, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[11].matrix = TSR({ 25.3496, 1.68974, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[12].matrix = TSR({ 29.5099, 1.06734, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[13].matrix = TSR({ 34.0692, 1.26314, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[14].matrix = TSR({ 38.3785, 0.774941, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[15].matrix = TSR({ 43.3268, 2.18606, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[16].matrix = TSR({ 44.5613, 1.00223, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[17].matrix = TSR({ 49.4174, 2.02013, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[18].matrix = TSR({ 41.7479, 1.19775, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[19].matrix = TSR({ 48.0504, 2.71727, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[20].matrix = TSR({ 47.2918, 0.80998, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[21].matrix = TSR({ 48.6042, 7.93406, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[22].matrix = TSR({ 46.2745, 6.78893, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[23].matrix = TSR({ 48.1731, 12.3996, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[24].matrix = TSR({ 48.4973, 17.2712, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[25].matrix = TSR({ 48.6649, 22.1225, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[26].matrix = TSR({ 47.1194, 25.3414, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[27].matrix = TSR({ 48.7091, 29.3777, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[28].matrix = TSR({ 48.6705, 35.184, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[29].matrix = TSR({ 0.760804, 31.4633, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[30].matrix = TSR({ 2.0965, 35.2207, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[31].matrix = TSR({ 0.841536, 39.2842, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[32].matrix = TSR({ 2.89485, 43.6928, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[33].matrix = TSR({ 1.44184, 48.3296, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[34].matrix = TSR({ 5.59274, 48.3067, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[35].matrix = TSR({ 9.56756, 49.1769, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[36].matrix = TSR({ 13.3267, 47.9841, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[37].matrix = TSR({ 17.6959, 48.8852, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[38].matrix = TSR({ 22.8705, 48.3067, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[39].matrix = TSR({ 27.6375, 48.8126, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[40].matrix = TSR({ 32.8059, 48.1631, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[41].matrix = TSR({ 37.5887, 49.1769, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[42].matrix = TSR({ 31.0865, 47.098, 0.0f }, 0.7f, 0.0f);
-    vk.instance_data[43].matrix = TSR({ 9.79052, 46.9576, 0.0f }, 0.7f, 0.0f);
 
-    for (uint32_t i = vk.model_meshes[1].base_instance; i < vk.model_meshes[1].active_instances + 2; i++)
-    {
-        vk.instance_data[i].id = 4;
-        vk.instance_data[i].skinned = 0;
-        vk.instance_data[i].color = {};
-    }
-
-    size_t instance_upload_size = sizeof(InstanceData) * 200;
+    size_t instance_upload_size = sizeof(InstanceData) * 1;
     wgpuQueueWriteBuffer(vk.queue, vk.instance_buffer.buffer, 0, vk.instance_data, instance_upload_size);
 }
 
@@ -560,23 +740,17 @@ void UpdateGPU()
     gubo.projView = mat4_multiply(cam.proj, cam.view);
     wgpuQueueWriteBuffer(vk.queue, vk.gubo_buffer.buffer, 0, &gubo, sizeof(gubo));
 
-    vk.instance_data[vk.model_meshes[2].base_instance].matrix = TSR({ p1.position.x, p1.position.y, 0.2f }, 1.0f, p1.angle);
+    vk.instance_data[vk.model_meshes[2].base_instance].matrix = TSR({ player[web.local_id].position.x, player[web.local_id].position.y, 0.2f }, 1.0f, player[web.local_id].angle);
     vk.instance_data[vk.model_meshes[2].base_instance].id = 3;
     vk.instance_data[vk.model_meshes[2].base_instance].skinned = 1;
     vk.instance_data[vk.model_meshes[2].base_instance].bone_offset = 0;
     vk.instance_data[vk.model_meshes[2].base_instance].color = { 0.0f, 0.0f, 0.0f , 1.0f };
 
-    vk.instance_data[vk.model_meshes[2].base_instance + 1].matrix = TSR({ p2.position.x, p2.position.y, 0.2f }, 1.0f, p2.angle);
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].matrix = TSR({ player[web.enemy_id].position.x, player[web.enemy_id].position.y, 0.2f }, 1.0f, player[web.enemy_id].angle);
     vk.instance_data[vk.model_meshes[2].base_instance + 1].id = 3;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].skinned = 1;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].bone_offset = 33;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].color = { 0.0f, 0.0f, 0.0f , 1.0f };
-
-    //vk.instance_data[vk.model_meshes[3].base_instance].matrix = TSR({ minion.position.x, minion.position.y, 0.0f }, 0.3f, 0.0f);
-    //vk.instance_data[vk.model_meshes[3].base_instance].id = 5;
-    //vk.instance_data[vk.model_meshes[3].base_instance].skinned = 1;
-    //vk.instance_data[vk.model_meshes[3].base_instance].bone_offset = 66;
-    //vk.instance_data[vk.model_meshes[3].base_instance].color = { 0.1f, 0.1f, 0.1f , 1.0f };
 
     size_t start_index = vk.model_meshes[2].base_instance;
     uint64_t gpu_byte_offset = start_index * sizeof(InstanceData);
@@ -584,10 +758,23 @@ void UpdateGPU()
     const void* cpu_data_pointer = &vk.instance_data[start_index];
     wgpuQueueWriteBuffer(vk.queue, vk.instance_buffer.buffer, gpu_byte_offset, cpu_data_pointer, instance_upload_size);
 
+    #ifdef __EMSCRIPTEN__
+    player[web.local_id].hp = player_states[web.local_id].hp;
+    if (player_states[web.local_id].hp == 0.0f)
+    {
+        player[web.local_id].hp = 100.0f;
+    }
+
+    player[web.enemy_id].hp = player_states[web.enemy_id].hp;
+    if (player_states[web.enemy_id].hp == 0.0f)
+    {
+        player[web.enemy_id].hp = 100.0f;
+    }
+    #endif
     vk.active_ui = 0;
     //WriteSmallBar(minion.position, 1.0f);
-    WriteLargeBarEnemy(p2.position, 3.7f, p2.hp);
-    WriteLargeBar(p1.position, 3.7f, p1.hp);
+    WriteLargeBarEnemy(player[web.enemy_id].position, 3.7f, player[web.enemy_id].hp);
+    WriteLargeBar(player[web.local_id].position, 3.7f, player[web.local_id].hp);
 
     size_t ui_upload_size = sizeof(InstanceDataUI) * vk.active_ui;
     wgpuQueueWriteBuffer(vk.queue, vk.instance_ui_buffer.buffer, 0, vk.instance_data_ui, ui_upload_size);
@@ -595,35 +782,35 @@ void UpdateGPU()
     float offset = 1.5f;
     float o_auto = 0.12f;
 
-    p1.bb.max = { p1.position.x + offset, p1.position.y + offset, p1.position.z + 2.7f };
-    p1.bb.min = { p1.position.x - offset, p1.position.y - offset, p1.position.z };
+    player[web.local_id].bb.max = { player[web.local_id].position.x + offset, player[web.local_id].position.y + offset, player[web.local_id].position.z + 2.7f };
+    player[web.local_id].bb.min = { player[web.local_id].position.x - offset, player[web.local_id].position.y - offset, player[web.local_id].position.z };
 
-    p2.bb.max = { p2.position.x + offset, p2.position.y + offset, p2.position.z + 2.7f };
-    p2.bb.min = { p2.position.x - offset, p2.position.y - offset, p2.position.z };
+    player[web.enemy_id].bb.max = { player[web.enemy_id].position.x + offset, player[web.enemy_id].position.y + offset, player[web.enemy_id].position.z + 2.7f };
+    player[web.enemy_id].bb.min = { player[web.enemy_id].position.x - offset, player[web.enemy_id].position.y - offset, player[web.enemy_id].position.z };
 
-    p1.autos.bb.min = { p1.autos.position.x + o_auto,  p1.autos.position.y + o_auto,  p1.autos.position.z + 4.2f };
-    p1.autos.bb.max = { p1.autos.position.x - o_auto,  p1.autos.position.y - o_auto,  p1.autos.position.z + 4.0f };
+    player[web.local_id].autos.bb.min = { player[web.local_id].autos.position.x + o_auto,  player[web.local_id].autos.position.y + o_auto,  player[web.local_id].autos.position.z + 4.2f };
+    player[web.local_id].autos.bb.max = { player[web.local_id].autos.position.x - o_auto,  player[web.local_id].autos.position.y - o_auto,  player[web.local_id].autos.position.z + 4.0f };
 
-    p2.autos.bb.min = { p2.autos.position.x + o_auto,  p2.autos.position.y + o_auto,  p2.autos.position.z + 4.2f };
-    p2.autos.bb.max = { p2.autos.position.x - o_auto,  p2.autos.position.y - o_auto,  p2.autos.position.z + 4.0f };
+    player[web.enemy_id].autos.bb.min = { player[web.enemy_id].autos.position.x + o_auto,  player[web.enemy_id].autos.position.y + o_auto,  player[web.enemy_id].autos.position.z + 4.2f };
+    player[web.enemy_id].autos.bb.max = { player[web.enemy_id].autos.position.x - o_auto,  player[web.enemy_id].autos.position.y - o_auto,  player[web.enemy_id].autos.position.z + 4.0f };
 
-    vk.instance_data_wire[0].max = { p1.autos.bb.max.x, p1.autos.bb.max.y, p1.autos.bb.max.z , 0.0f };
-    vk.instance_data_wire[0].min = { p1.autos.bb.min.x, p1.autos.bb.min.y, p1.autos.bb.min.z , 0.0f };
+    vk.instance_data_wire[0].max = { player[web.local_id].autos.bb.max.x, player[web.local_id].autos.bb.max.y, player[web.local_id].autos.bb.max.z , 0.0f };
+    vk.instance_data_wire[0].min = { player[web.local_id].autos.bb.min.x, player[web.local_id].autos.bb.min.y, player[web.local_id].autos.bb.min.z , 0.0f };
     vk.instance_data_wire[0].color = { 1.0f, 0.0f, 0.0f, 1.0f };
     vk.instance_data_wire[0].id = 0;
 
-    vk.instance_data_wire[1].max = { p2.autos.bb.max.x, p2.autos.bb.max.y, p2.autos.bb.max.z , 0.0f };
-    vk.instance_data_wire[1].min = { p2.autos.bb.min.x, p2.autos.bb.min.y, p2.autos.bb.min.z , 0.0f };
+    vk.instance_data_wire[1].max = { player[web.enemy_id].autos.bb.max.x, player[web.enemy_id].autos.bb.max.y, player[web.enemy_id].autos.bb.max.z , 0.0f };
+    vk.instance_data_wire[1].min = { player[web.enemy_id].autos.bb.min.x, player[web.enemy_id].autos.bb.min.y, player[web.enemy_id].autos.bb.min.z , 0.0f };
     vk.instance_data_wire[1].color = { 1.0f, 0.0f, 0.0f, 1.0f };
     vk.instance_data_wire[1].id = 0;
 
-    vk.instance_data_wire[2].max = { p1.bb.max.x, p1.bb.max.y, p1.bb.max.z };
-    vk.instance_data_wire[2].min = { p1.bb.min.x, p1.bb.min.y, p1.bb.min.z };
+    vk.instance_data_wire[2].max = { player[web.local_id].bb.max.x, player[web.local_id].bb.max.y, player[web.local_id].bb.max.z };
+    vk.instance_data_wire[2].min = { player[web.local_id].bb.min.x, player[web.local_id].bb.min.y, player[web.local_id].bb.min.z };
     vk.instance_data_wire[2].color = { 1.0f, 0.0f, 0.0f, 1.0f };
     vk.instance_data_wire[2].id = 0;
 
-    vk.instance_data_wire[3].max = { p2.bb.max.x, p2.bb.max.y, p2.bb.max.z };
-    vk.instance_data_wire[3].min = { p2.bb.min.x, p2.bb.min.y, p2.bb.min.z };
+    vk.instance_data_wire[3].max = { player[web.enemy_id].bb.max.x, player[web.enemy_id].bb.max.y, player[web.enemy_id].bb.max.z };
+    vk.instance_data_wire[3].min = { player[web.enemy_id].bb.min.x, player[web.enemy_id].bb.min.y, player[web.enemy_id].bb.min.z };
     vk.instance_data_wire[3].color = { 1.0f, 0.0f, 0.0f, 1.0f };
     vk.instance_data_wire[3].id = 0;
 
@@ -679,32 +866,36 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
 {   
     switch (key)
     {
-        
         case GLFW_KEY_Q: 
         {
-
+            cam.pos.z++;
+            cam.look_at.z++;
         } break;
         case GLFW_KEY_E:
         {
-
+            cam.pos.z--;
+            cam.look_at.z--;
         } break;
         case GLFW_KEY_S:
         {
             if (action == GLFW_PRESS)
             {
-                p1.moving = false;
-                p1.destination = p1.position;
+                player[web.local_id].moving = false;
+                player[web.local_id].destination = player[web.local_id].position;
+                #ifdef __EMSCRIPTEN__
+                JS_SendInput(0.0f, 0.0f, KEY_S, PRESSED, 2);
+                #endif  
             }
         } break;
         case GLFW_KEY_B:
         {
             if (action == GLFW_PRESS)
             {
-                // if (gubo.debug)
-                // {
-                //     gubo.debug = 0;
-                // }
-                 //else { gubo.debug = 1; }
+                 if (gubo.debug)
+                 {
+                     gubo.debug = 0;
+                 }
+                 else { gubo.debug = 1; }
             }
         } break;
         case GLFW_KEY_SPACE:
@@ -740,34 +931,50 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
         {
             if (action == GLFW_PRESS)
             {
-                input.collision = GetRayCollisionBox(input.ray, p2.bb);
+                input.collision = GetRayCollisionBox(input.ray, player[web.enemy_id].bb);
                 if (input.collision.hit)
                 {
-                    p1.destination = input.collision.point;
-                    p1.movement.x = p1.destination.x - p1.position.x;
-                    p1.movement.y = p1.destination.y - p1.position.y;
+                    player[web.local_id].destination = input.collision.point;
+                    player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
+                    player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
+                    player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+                    player[web.local_id].movement *= player[web.local_id].speed;
+                    player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
 
-                    p1.angle = (atan2f(p1.movement.y, p1.movement.x)) + 1.5708;
-
-                    p1.moving = false;
-                    SetEntityAnimation(&p1, 3, true);
+                    if (v2_distance({ player[web.local_id].position.x, player[web.local_id].position.y },
+                        { player[web.enemy_id].position.x, player[web.enemy_id].position.y }) <= 10.0f)
+                    {
+                        player[web.local_id].moving = false;
+                        SetEntityAnimation(&player[web.local_id], 3, true);
+                        player[web.local_id].targeting = false;
+                    }
+                    else
+                    {
+                        player[web.local_id].moving = true;
+                        player[web.local_id].targeting = true;
+                    }
+                    #ifdef __EMSCRIPTEN__
+                    JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, web.enemy_id);
+                    #endif 
                 }
-                else
+                if(!input.collision.hit)
                 {
                     input.collision = GetRayCollisionBox(input.ray, world_box);
                     if (!input.collision.hit) break;
 
-                    p1.destination = input.collision.point;
-                    p1.movement.x = p1.destination.x - p1.position.x;
-                    p1.movement.y = p1.destination.y - p1.position.y;
-                    p1.movement = v3_normalize(p1.movement);
-                    p1.movement *= p1.speed;
+                    player[web.local_id].destination = input.collision.point;
+                    player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
+                    player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
+                    player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+                    player[web.local_id].movement *= player[web.local_id].speed;
 
-                    p1.angle = (atan2f(p1.movement.y, p1.movement.x)) + 1.5708;
-                    p1.moving = true;
+                    player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+                    player[web.local_id].moving = true;
+                    player[web.local_id].targeting = false;
 
-                    //UpdateVertexGrid();
-                    //AddTree();
+                    #ifdef __EMSCRIPTEN__
+                    JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, 2);
+                    #endif  
                 }
             }
         } break;
@@ -777,20 +984,19 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
             {
                 if (input.a.pressed)
                 {
-                    input.collision = GetRayCollisionBox(input.ray, p2.bb);
+                    input.collision = GetRayCollisionBox(input.ray, player[web.enemy_id].bb);
                     if (!input.collision.hit) break;
 
-                    p1.destination = input.collision.point;
-                    p1.movement.x = p1.destination.x - p1.position.x;
-                    p1.movement.y = p1.destination.y - p1.position.y;
+                    player[web.local_id].destination = input.collision.point;
+                    player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
+                    player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
 
-                    p1.angle = (atan2f(p1.movement.y, p1.movement.x)) + 1.5708;
+                    player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
 
-                    p1.moving = false;
-                    SetEntityAnimation(&p1, 3, true);
+                    player[web.local_id].moving = false;
+                    SetEntityAnimation(&player[web.local_id], 3, true);
                     input.a.pressed = false;
                 }
-                //DeleteTree();
             }
         } break;
     }
@@ -970,73 +1176,147 @@ WGPUTexture CreateTextureArray(uint32_t resolution)
     desc.size.width = resolution;
     desc.size.height = resolution;
     desc.size.depthOrArrayLayers = MAX_TEXTURES;
-    desc.mipLevelCount = 1;
+    desc.mipLevelCount = 10;
     desc.sampleCount = 1;
     desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
 
     WGPUTexture tex_array = {};
     return tex_array = wgpuDeviceCreateTexture(vk.device, &desc);
 }
-void UploadTextureLayer(uint32_t tex_id, uint32_t width, uint32_t height, const uint8_t* raw_pixels)
+void UploadTextureLayer(uint32_t tex_id, uint32_t width, uint32_t height, uint32_t mip_level,  const uint8_t* raw_pixels)
 {
     WGPUTexelCopyTextureInfo dest = {};
     dest.texture = vk.tex_array.tex;
-    dest.mipLevel = 0;
+    dest.mipLevel = mip_level;
     dest.origin.x = 0;
     dest.origin.y = 0;
     dest.origin.z = tex_id;
     dest.aspect = WGPUTextureAspect_All;
 
-    uint32_t bytes_per_row = ((width * 4) + 255) & ~255;
+    uint32_t unpadded_bytes_per_row = width * 4;
+    uint32_t padded_bytes_per_row = ((unpadded_bytes_per_row) + 255) & ~255;
 
     WGPUTexelCopyBufferLayout layout = {};
     layout.offset = 0;
-    layout.bytesPerRow = bytes_per_row;
+    layout.bytesPerRow = padded_bytes_per_row;
     layout.rowsPerImage = height;
+
+    const uint8_t* upload_ptr = raw_pixels;
+    uint8_t* padded_pixels = NULL;
+
+    if (padded_bytes_per_row != unpadded_bytes_per_row)
+    {
+        padded_pixels = (uint8_t*)malloc(padded_bytes_per_row * height);
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            memcpy(padded_pixels + y * padded_bytes_per_row, raw_pixels + y * unpadded_bytes_per_row, unpadded_bytes_per_row);
+        }
+        upload_ptr = padded_pixels;
+    }
 
     WGPUExtent3D extent = {};
     extent.width = width;
     extent.height = height;
     extent.depthOrArrayLayers = 1;
 
-    wgpuQueueWriteTexture(vk.queue, &dest, raw_pixels, width * height * 4, &layout, &extent);
+    wgpuQueueWriteTexture(vk.queue, &dest, upload_ptr, padded_bytes_per_row * height, &layout, &extent);
+
+    if (padded_pixels != NULL)
+    {
+        free(padded_pixels);
+    }
 }
-void LoadTexture(const char* path, uint32_t tex_id)
+void LoadTexture(const char* path, uint32_t tex_id, uint32_t max_mipmaps)
 {
     int w, h, c;
     stbi_uc* pixels = stbi_load(path, &w, &h, &c, 4);
 
-    if (pixels == nullptr)
+    if (pixels == NULL)
     {
-        std::cerr << "failed to load texture: " << path << std::endl;
+        fprintf(stderr, "failed to load texture: %s\n", path);
         return;
     }
 
-    uint32_t image_size = w * h * 4;
-    uint8_t* dest = (uint8_t*)malloc(image_size);
-    memcpy(dest, pixels, image_size);
+    uint32_t current_width = (uint32_t)w;
+    uint32_t current_height = (uint32_t)h;
+
+    size_t current_size = current_width * current_height * 4;
+    uint8_t* current_pixels = (uint8_t*)malloc(current_size);
+    memcpy(current_pixels, pixels, current_size);
     stbi_image_free(pixels);
 
-    UploadTextureLayer(tex_id, w, h, dest);
+    for (uint32_t level = 0; level < max_mipmaps; ++level)
+    {
+        UploadTextureLayer(tex_id, current_width, current_height, level, current_pixels);
 
-    free(dest);
+        if (current_width == 1 && current_height == 1) break;
+
+        uint32_t next_width = current_width > 1 ? (current_width / 2) : 1;
+        uint32_t next_height = current_height > 1 ? (current_height / 2) : 1;
+
+        size_t next_size = next_width * next_height * 4;
+        uint8_t* next_pixels = (uint8_t*)malloc(next_size);
+
+        for (uint32_t y = 0; y < next_height; ++y)
+        {
+            for (uint32_t x = 0; x < next_width; ++x)
+            {
+                uint32_t src_x = x * 2;
+                uint32_t src_y = y * 2;
+
+                unsigned int r = 0, g = 0, b = 0, a = 0;
+                int count = 0;
+
+                for (uint32_t dy = 0; dy < 2; ++dy)
+                {
+                    for (uint32_t dx = 0; dx < 2; ++dx)
+                    {
+                        uint32_t nx = src_x + dx;
+                        uint32_t ny = src_y + dy;
+                        if (nx < current_width && ny < current_height)
+                        {
+                            size_t idx = (ny * current_width + nx) * 4;
+                            r += current_pixels[idx + 0];
+                            g += current_pixels[idx + 1];
+                            b += current_pixels[idx + 2];
+                            a += current_pixels[idx + 3];
+                            count++;
+                        }
+                    }
+                }
+
+                size_t dest_idx = (y * next_width + x) * 4;
+                next_pixels[dest_idx + 0] = (uint8_t)(r / count);
+                next_pixels[dest_idx + 1] = (uint8_t)(g / count);
+                next_pixels[dest_idx + 2] = (uint8_t)(b / count);
+                next_pixels[dest_idx + 3] = (uint8_t)(a / count);
+            }
+        }
+
+        free(current_pixels);
+        current_pixels = next_pixels;
+        current_width = next_width;
+        current_height = next_height;
+    }
+
+    free(current_pixels);
 }
 void LoadTextures()
 {
     uint32_t offset = 0;
-    LoadTexture("assets/alphamask.png", offset);
+    LoadTexture("assets/alphamask.png", offset, 1);
     offset++;
-    LoadTexture("assets/brick.png", offset);
+    LoadTexture("assets/grass.png", offset, 10);
     offset++;
-    LoadTexture("assets/dirt.png", offset);
+    LoadTexture("assets/dirt.png", offset, 10);
     offset++;
-    LoadTexture("assets/player.png", offset);
+    LoadTexture("assets/player.png", offset, 10);
     offset++;
-    LoadTexture("assets/tree.png", offset);
+    LoadTexture("assets/tree.png", offset, 10);
     offset++;
-    LoadTexture("assets/stone_blue.png", offset);
+    LoadTexture("assets/stone_blue.png", offset, 10);
     offset++;
-    LoadTexture("assets/atlas_ui.png", offset);
+    LoadTexture("assets/atlas_ui.png", offset, 1);
 }
 PipelineInfo CreatePipelineInfo(uint32_t opaque, uint32_t v_buffer_count, WGPUOptionalBool write, WGPUPrimitiveTopology topology,
                                 WGPUCompareFunction compare, WGPUCullMode cull_mode)
@@ -1214,7 +1494,7 @@ WGPUBindGroup CreateBindGroups(WGPUBindGroupLayout layout)
     texture_array_view.format = WGPUTextureFormat_RGBA8UnormSrgb;
     texture_array_view.dimension = WGPUTextureViewDimension_2DArray;
     texture_array_view.baseMipLevel = 0;
-    texture_array_view.mipLevelCount = 1;
+    texture_array_view.mipLevelCount = 10;
     texture_array_view.baseArrayLayer = 0;
     texture_array_view.arrayLayerCount = MAX_TEXTURES;
     texture_array_view.aspect = WGPUTextureAspect_All;
@@ -1226,12 +1506,12 @@ WGPUBindGroup CreateBindGroups(WGPUBindGroupLayout layout)
     sampler_desc.addressModeU = WGPUAddressMode_Repeat;
     sampler_desc.addressModeV = WGPUAddressMode_Repeat;
     sampler_desc.addressModeW = WGPUAddressMode_Repeat;
-    sampler_desc.magFilter = WGPUFilterMode_Nearest;
-    sampler_desc.minFilter = WGPUFilterMode_Nearest;
-    sampler_desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+    sampler_desc.magFilter = WGPUFilterMode_Linear;
+    sampler_desc.minFilter = WGPUFilterMode_Linear;
+    sampler_desc.mipmapFilter = WGPUMipmapFilterMode_Linear;
     sampler_desc.lodMinClamp = 0.0f;
     sampler_desc.lodMaxClamp = 32.0f;
-    sampler_desc.maxAnisotropy = 1;
+    sampler_desc.maxAnisotropy = 16;
     vk.linear_sampler = wgpuDeviceCreateSampler(vk.device, &sampler_desc);
     entries[3].binding = 3;
     entries[3].sampler = vk.linear_sampler;
@@ -1553,39 +1833,9 @@ void GetBoneMatrices(Entity* player)
     ufbx_free_scene(eval);
 }
 
-void UpdatePositions()
+float alpha = 1.0f - expf(-15.0f * vk.physics_dt);
+void UpdateCamPosition()
 {
-    if ((p1.moving) && (v2_distance({ p1.position.x, p1.position.y },
-        { p1.destination.x, p1.destination.y }) > 0.1f))
-    {
-        p1.position += p1.movement;
-    }
-    else { p1.moving = false; }
-
-    if (!p1.autos.moving)
-    {
-        p1.autos.position = p1.position;
-    }
-    else
-    {
-        p1.autos.destination = p2.position;
-        p1.autos.movement.x = p1.autos.destination.x - p1.autos.position.x;
-        p1.autos.movement.y = p1.autos.destination.y - p1.autos.position.y;
-        p1.autos.movement = v3_normalize(p1.autos.movement);
-        p1.autos.movement *= p1.autos.speed;
-        p1.autos.position += p1.autos.movement;
-
-        if (v2_distance({ p1.autos.position.x, p1.autos.position.y }, { p2.position.x, p2.position.y }) <= 1.0f)
-        {
-            p1.autos.moving = false;
-            p1.autos.position = p1.position;
-            if (p2.hp != 0.0f)
-            {
-                p2.hp -= 5.0f;
-            }
-        }
-    }
-
     if ((input.mouse_pos.x < 30) && (cam.pos.x > 5.0))
     {
         cam.pos.x -= cam.speed;
@@ -1609,63 +1859,279 @@ void UpdatePositions()
 
     if (input.spacebar.ended_down)
     {
-        cam.pos = { p1.position.x, p1.position.y - 15.0f, 35.0f };
-        cam.look_at = { p1.position.x, p1.position.y + 1.0f, 1.0f };
+        cam.pos = { player[web.local_id].position.x, player[web.local_id].position.y - 15.0f, 35.0f };
+        cam.look_at = { player[web.local_id].position.x, player[web.local_id].position.y + 1.0f, 1.0f };
     }
 
     input.ray.position = { cam.pos };
 }
-void UpdateEnemy()
+void UpdatePositions()
 {
-    p2.destination = p1.position;
-    p2.movement.x = p2.destination.x - p2.position.x;
-    p2.movement.y = p2.destination.y - p2.position.y;
-    p2.movement = v3_normalize(p2.movement);
-    p2.movement *= p2.speed;
-
-    p2.angle = (atan2f(p2.movement.y, p2.movement.x)) + 1.5708;
-
-    if (p2.can_move)
+    if (player[web.local_id].moving)
     {
-        if ((v2_distance({ p2.position.x, p2.position.y }, { p2.destination.x, p2.destination.y }) >= 10.0f))
+        float dist = v2_distance({ player[web.local_id].position.x, player[web.local_id].position.y },
+            { player[web.local_id].destination.x, player[web.local_id].destination.y });
+
+        if (dist > 0.1f)
         {
-            p2.position += p2.movement;
-            p2.moving = true;
-            p2.in_range = false;
+            player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
+            player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
+            player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+            player[web.local_id].movement *= player[web.local_id].speed;
+
+            player[web.local_id].position += player[web.local_id].movement;
         }
-        else
-        {
-            p2.moving = false;
-            p2.in_range = true;
-            p2.can_move = false;
-        }
-    }
-    else if ((v2_distance({ p2.position.x, p2.position.y }, { p2.destination.x, p2.destination.y }) >= 12.0f))
-    {
-        p2.can_move = true;
+        else { player[web.local_id].moving = false; }
     }
 
-    if (!p2.autos.moving)
+    if (!player[web.local_id].autos.moving)
     {
-        p2.autos.position = p2.position;
+        player[web.local_id].autos.position = player[web.local_id].position;
     }
     else
     {
-        p2.autos.destination = p1.position;
-        p2.autos.movement.x = p2.autos.destination.x - p2.autos.position.x;
-        p2.autos.movement.y = p2.autos.destination.y - p2.autos.position.y;
-        p2.autos.movement = v3_normalize(p2.autos.movement);
-        p2.autos.movement *= p2.autos.speed;
-        p2.autos.position += p2.autos.movement;
+        player[web.local_id].autos.destination = player[web.enemy_id].position;
+        player[web.local_id].autos.movement.x = player[web.local_id].autos.destination.x - player[web.local_id].autos.position.x;
+        player[web.local_id].autos.movement.y = player[web.local_id].autos.destination.y - player[web.local_id].autos.position.y;
+        player[web.local_id].autos.movement = v3_normalize(player[web.local_id].autos.movement);
+        player[web.local_id].autos.movement *= player[web.local_id].autos.speed;
+        player[web.local_id].autos.position += player[web.local_id].autos.movement;
 
-        if (v2_distance({ p2.autos.position.x, p2.autos.position.y }, { p1.position.x, p1.position.y }) <= 1.0f)
+        if (v2_distance({ player[web.local_id].autos.position.x, player[web.local_id].autos.position.y },
+            { player[web.enemy_id].position.x, player[web.enemy_id].position.y }) <= 1.0f)
         {
-            p2.autos.moving = false;
-            p2.autos.position = p2.position;
-            if (p1.hp != 0.0f)
+            player[web.local_id].autos.moving = false;
+            player[web.local_id].autos.position = player[web.local_id].position;
+        }
+    }
+
+#ifdef __EMSCRIPTEN__
+
+    float dist_from_server = v2_distance(
+        { player[web.local_id].position.x, player[web.local_id].position.y },
+        { player_states[web.local_id].x, player_states[web.local_id].y });
+
+    if (dist_from_server > 10.0f)
+    {
+        player[web.local_id].position.x = player_states[web.local_id].x;
+        player[web.local_id].position.y = player_states[web.local_id].y;
+        cam.pos = { player[web.local_id].position.x, player[web.local_id].position.y - 15.0f, 35.0f };
+        cam.look_at = { player[web.local_id].position.x, player[web.local_id].position.y + 1.0f, 1.0f };
+    }
+    else
+    {
+        player[web.local_id].position.x += (player_states[web.local_id].x - player[web.local_id].position.x) * alpha;
+        player[web.local_id].position.y += (player_states[web.local_id].y - player[web.local_id].position.y) * alpha;
+    }
+
+    if (player_states[web.local_id].status_flags & IS_DEAD)
+    {
+        player[web.local_id].moving = false;
+        player[web.local_id].targeting = false;
+        player[web.local_id].position = player[web.local_id].origin;
+    }
+
+    if (player_states[web.local_id].status_flags & IS_CASTING)
+    {
+        player[web.local_id].movement.x = player[web.enemy_id].position.x - player[web.local_id].position.x;
+        player[web.local_id].movement.y = player[web.enemy_id].position.y - player[web.local_id].position.y;
+        player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+        player[web.local_id].movement *= player[web.local_id].speed;
+
+        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+        player[web.local_id].moving = false;
+    }
+    else if (player_states[web.local_id].status_flags & IS_MOVING)
+    {
+        player[web.local_id].moving = true;
+        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+    }
+
+#endif
+
+    if ((v2_distance({ player[web.local_id].position.x, player[web.local_id].position.y },
+        { player[web.enemy_id].position.x, player[web.enemy_id].position.y }) <= 10.0f) && (player[web.local_id].targeting))
+    {
+        player[web.local_id].moving = false;
+        player[web.local_id].targeting = false;
+
+        #ifdef __EMSCRIPTEN__
+        JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, web.enemy_id);
+        #endif      
+    }
+}
+void UpdateEnemy()
+{
+#ifdef __EMSCRIPTEN__
+    float enemy_dist_from_server = v2_distance(
+        { player[web.enemy_id].position.x, player[web.enemy_id].position.y },
+        { player_states[web.enemy_id].x, player_states[web.enemy_id].y });
+
+    if (enemy_dist_from_server > 10.0f)
+    {
+        player[web.enemy_id].position.x = player_states[web.enemy_id].x;
+        player[web.enemy_id].position.y = player_states[web.enemy_id].y;
+    }
+    else
+    {
+        player[web.enemy_id].position.x += (player_states[web.enemy_id].x - player[web.enemy_id].position.x) * alpha;
+        player[web.enemy_id].position.y += (player_states[web.enemy_id].y - player[web.enemy_id].position.y) * alpha;
+    }
+
+    if (player_states[web.enemy_id].status_flags & IS_MOVING)
+    {
+        player[web.enemy_id].movement.x = player_states[web.enemy_id].dx - player[web.enemy_id].position.x;
+        player[web.enemy_id].movement.y = player_states[web.enemy_id].dy - player[web.enemy_id].position.y;
+        player[web.enemy_id].movement = v3_normalize(player[web.enemy_id].movement);
+        player[web.enemy_id].movement *= player[web.enemy_id].speed;
+
+        player[web.enemy_id].angle = (atan2f(player[web.enemy_id].movement.y, player[web.enemy_id].movement.x)) + 1.5708;
+        player[web.enemy_id].moving = true;
+    }
+    else
+    {
+        player[web.enemy_id].moving = false;
+    }
+
+    if ((player_states[web.enemy_id].status_flags & IS_CASTING) && (player[web.enemy_id].current_anim_id != 3))
+    {
+        SetEntityAnimation(&player[web.enemy_id], 3, true);
+    }
+
+    if (player_states[web.enemy_id].status_flags & IS_CASTING)
+    {
+        player[web.enemy_id].movement.x = player[web.local_id].position.x - player[web.enemy_id].position.x;
+        player[web.enemy_id].movement.y = player[web.local_id].position.y - player[web.enemy_id].position.y;
+        player[web.enemy_id].movement = v3_normalize(player[web.enemy_id].movement);
+        player[web.enemy_id].movement *= player[web.enemy_id].speed;
+
+        player[web.enemy_id].angle = (atan2f(player[web.enemy_id].movement.y, player[web.enemy_id].movement.x)) + 1.5708;
+        player[web.enemy_id].moving = false;
+    }
+
+    if (!player[web.enemy_id].autos.moving)
+    {
+        player[web.enemy_id].autos.position = player[web.enemy_id].position;
+    }
+    else
+    {
+        player[web.enemy_id].autos.destination = player[web.local_id].position;
+        player[web.enemy_id].autos.movement.x = player[web.enemy_id].autos.destination.x - player[web.enemy_id].autos.position.x;
+        player[web.enemy_id].autos.movement.y = player[web.enemy_id].autos.destination.y - player[web.enemy_id].autos.position.y;
+        player[web.enemy_id].autos.movement = v3_normalize(player[web.enemy_id].autos.movement);
+        player[web.enemy_id].autos.movement *= player[web.enemy_id].autos.speed;
+        player[web.enemy_id].autos.position += player[web.enemy_id].autos.movement;
+
+        if (v2_distance({ player[web.enemy_id].autos.position.x, player[web.enemy_id].autos.position.y },
+            { player[web.local_id].position.x, player[web.local_id].position.y }) <= 1.0f)
+        {
+            player[web.enemy_id].autos.moving = false;
+            player[web.enemy_id].autos.position = player[web.local_id].position;
+        }
+    }
+
+    if (player_states[web.enemy_id].status_flags & IS_DEAD)
+    {
+        player[web.enemy_id].moving = false;
+        player[web.enemy_id].targeting = false;
+        player[web.enemy_id].position = player[web.enemy_id].origin;
+    }
+#endif 
+}
+void EvaluateAnimations(float delta)
+{
+    if (player[web.local_id].moving)
+    {
+        SetEntityAnimation(&player[web.local_id], 4, true);
+    }
+#ifdef __EMSCRIPTEN__
+    else if (player_states[web.local_id].status_flags & IS_CASTING)
+    {
+        SetEntityAnimation(&player[web.local_id], 3, true);
+    }
+#endif
+    else
+    {
+        SetEntityAnimation(&player[web.local_id], 1, true);
+    }
+
+    if (player[web.enemy_id].moving)
+    {
+        SetEntityAnimation(&player[web.enemy_id], 4, true);
+    }
+#ifdef __EMSCRIPTEN__
+    else if (player_states[web.enemy_id].status_flags & IS_CASTING)
+    {
+        SetEntityAnimation(&player[web.enemy_id], 3, true);
+    }
+#endif
+    else
+    {
+        SetEntityAnimation(&player[web.enemy_id], 1, true);
+    }
+
+    UpdateEntityAnimation(&player[web.local_id], delta);
+    UpdateEntityAnimation(&player[web.enemy_id], delta);
+
+    GetBoneMatrices(&player[web.local_id]);
+    GetBoneMatrices(&player[web.enemy_id]);
+
+    CheckAnimationEvents(&player[web.local_id], delta);
+    CheckAnimationEvents(&player[web.enemy_id], delta);
+}
+void CheckMouseHover()
+{
+    input.ray.direction = RayCast(input.mouse_pos.x, input.mouse_pos.y,
+                                  cam.view, cam.proj, (float)win.extent_x, (float)win.extent_y);
+    input.collision = GetRayCollisionBox(input.ray, player[web.enemy_id].bb);
+    if (!input.collision.hit)
+    {
+        ModelMeshes model = vk.model_meshes[2];
+        if (vk.indirect_cmds[vk.active_commands].index_count != 0)
+        {
+            for (uint32_t i = 0; i < model.submesh_count; ++i)
             {
-                p1.hp -= 10.0f;
+                DrawIndexedIndirectCommand cmd{};
+                vk.indirect_cmds[vk.active_commands + i] = cmd;
             }
+
+            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
+            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
+            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset,
+                &vk.indirect_cmds[vk.active_commands], instance_upload_size);
+#ifdef __EMSCRIPTEN__
+            SetCursor("cursor.png");
+#endif
+        }
+    }
+    else
+    {
+        vk.hovering = true;
+
+        if (vk.indirect_cmds[vk.active_commands].index_count == 0)
+        {
+            ModelMeshes model = vk.model_meshes[2];
+            for (uint32_t i = 0; i < model.submesh_count; ++i)
+            {
+                uint32_t index = model.submesh_index + i;
+
+                DrawIndexedIndirectCommand cmd{};
+                cmd.index_count = vk.meshes_alloc[index].index_count;
+                cmd.instance_count = 1;
+                cmd.first_index = vk.meshes_alloc[index].first_index;
+                cmd.vertex_offset = vk.meshes_alloc[index].vertex_offset;
+                cmd.first_instance = model.base_instance + 1;
+
+                vk.indirect_cmds[vk.active_commands + i] = cmd;
+            }
+
+            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
+            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
+            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset,
+                &vk.indirect_cmds[vk.active_commands], instance_upload_size);
+#ifdef __EMSCRIPTEN__
+            SetCursor("cursor_red.png");
+#endif
         }
     }
 }
@@ -1758,35 +2224,48 @@ void InitWorld()
 {
     cam.model = mat4_diagonal(1.0f);
     cam.proj = mat4_perspective(DegToRad(40.0f), (float)win.extent_x / (float)win.extent_y, 1.0f);
-    cam.pos = { 15.0f, 0.0f, 35.0f };
-    cam.look_at = { 15.0f, 16.0f, 1.0f };
     cam.speed = 100.0f * vk.physics_dt;
     world_box.min = { 0.0f, 0.0f, 0.0f };
     world_box.max = { 50.0f, 50.0f, 0.0f };
 
-    p1 = {};
-    p1.position = { 15.0f, 15.0f, 0.0f };
-    p1.speed = 5.0f * vk.physics_dt;
-    p1.moving = false;
-    p1.model_mesh = &vk.model_meshes[2];
-    p1.instance_data.bone_offset = 0;
-    p1.current_anim_id = 1;
-    p1.autos = {};
-    p1.autos.origin = p1.position;
-    p1.autos.position = p1.position;;
-    p1.autos.speed = 30.0f * vk.physics_dt;
+    player[web.local_id] = {};
+    player[web.enemy_id] = {};
 
-    p2 = {};
-    p2.position = { 35.0f, 35.0f, 0.0f };
-    p2.speed = 4.5f * vk.physics_dt;
-    p2.moving = false;
-    p2.model_mesh = &vk.model_meshes[2];
-    p2.instance_data.bone_offset = 33;
-    p2.current_anim_id = 1;
-    p2.autos = {};
-    p2.autos.origin = p2.position;
-    p2.autos.position = p2.position;
-    p2.autos.speed = 30.0f * vk.physics_dt;
+    if (web.local_id == 0)
+    {
+        player[web.local_id].position = { 15.0f, 15.0f, 0.0f };
+        player[web.enemy_id].position = { 35.0f, 35.0f, 0.0f };
+        player[web.local_id].origin = { 15.0f, 15.0f, 0.0f };
+        player[web.enemy_id].origin = { 35.0f, 35.0f, 0.0f };
+    }
+    else
+    {
+        player[web.local_id].position = { 35.0f, 35.0f, 0.0f };
+        player[web.enemy_id].position = { 15.0f, 15.0f, 0.0f };
+        player[web.local_id].origin = { 35.0f, 35.0f, 0.0f };
+        player[web.enemy_id].origin = { 15.0f, 15.0f, 0.0f };
+    }
+
+    cam.pos = { 25.0f, 10.0f, 35.0f };
+    cam.look_at = { 25.0f, 26.0f, 1.0f };
+
+    player[web.local_id].speed = 5.0f * vk.physics_dt;
+    player[web.local_id].moving = false;
+    player[web.local_id].model_mesh = &vk.model_meshes[2];
+    player[web.local_id].instance_data.bone_offset = 0;
+    player[web.local_id].current_anim_id = 1;
+    player[web.local_id].autos = {};
+    player[web.local_id].autos.position = player[web.local_id].position;;
+    player[web.local_id].autos.speed = 30.0f * vk.physics_dt;
+
+    player[web.enemy_id].speed = 5.0f * vk.physics_dt;
+    player[web.enemy_id].moving = false;
+    player[web.enemy_id].model_mesh = &vk.model_meshes[2];
+    player[web.enemy_id].instance_data.bone_offset = 33;
+    player[web.enemy_id].current_anim_id = 1;
+    player[web.enemy_id].autos = {};
+    player[web.enemy_id].autos.position = player[web.enemy_id].position;
+    player[web.enemy_id].autos.speed = 30.0f * vk.physics_dt;
 
     gubo = {};
     gubo.window = { (float)win.extent_x, (float)win.extent_y };
@@ -2006,117 +2485,51 @@ void InitVk()
     JS_InitAudio();
     JS_LoadSound("fireball.mp3", "click");
     SetCursor("cursor.png");
-#endif 
+#else
+    web.local_id = 0;
+    web.enemy_id = 1;
+#endif
 }
+
+bool cam_init = false;
 void UpdateGame(float delta)
 {
-    if (delta > 0.1f) delta = 0.1f;
-
+    if (!cam_init)
+    {
+        if (web.local_id == 0)
+        {
+            cam.pos = { 15.0f, 0.0f, 35.0f };
+            cam.look_at = { 15.0f, 16.0f, 1.0f };
+        }
+        else
+        {
+            cam.pos = { 35.0f, 20.0f, 35.0f };
+            cam.look_at = { 35.0f, 36.0f, 1.0f };
+        }
+        cam_init = true;
+    }
     vk.accumulator += delta;
 
     while (vk.accumulator >= vk.physics_dt)
     {
+        UpdateCamPosition();
         UpdatePositions();
         UpdateEnemy();
         vk.accumulator -= vk.physics_dt;
     }
 
-    if (p1.moving)
-    {
-        SetEntityAnimation(&p1, 4, true);
-    }
-    else if (p1.current_anim_id != 4)
-    {
-        SetEntityAnimation(&p1, p1.current_anim_id, true);
-    }
-    else
-    {
-        SetEntityAnimation(&p1, 1, true);
-    }
-
-    if (p2.moving)
-    {
-        SetEntityAnimation(&p2, 4, true);
-    }
-    if (p2.in_range)
-    {
-        SetEntityAnimation(&p2, 3, true);
-    }
-
-    UpdateEntityAnimation(&p1, delta);
-    UpdateEntityAnimation(&p2, delta);
-
-    GetBoneMatrices(&p1);
-    GetBoneMatrices(&p2);
-
-    CheckAnimationEvents(&p1, delta);
-    CheckAnimationEvents(&p2, delta);
-
-    input.ray.direction = RayCast(input.mouse_pos.x, input.mouse_pos.y,
-        cam.view, cam.proj, (float)win.extent_x, (float)win.extent_y);
-    input.collision = GetRayCollisionBox(input.ray, p2.bb);
-    if (!input.collision.hit)
-    {
-        ModelMeshes model = vk.model_meshes[2];
-        if (vk.indirect_cmds[vk.active_commands].index_count != 0)
-        {
-            for (uint32_t i = 0; i < model.submesh_count; ++i)
-            {
-                DrawIndexedIndirectCommand cmd{};
-                vk.indirect_cmds[vk.active_commands + i] = cmd;
-            }
-
-            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
-            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
-            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset, &vk.indirect_cmds[vk.active_commands], instance_upload_size);
-
-#ifdef __EMSCRIPTEN__
-            SetCursor("cursor.png");
-#endif
-        }
-    }
-    else
-    {
-        vk.hovering = true;
-
-        if (vk.indirect_cmds[vk.active_commands].index_count == 0)
-        {
-            ModelMeshes model = vk.model_meshes[2];
-            for (uint32_t i = 0; i < model.submesh_count; ++i)
-            {
-                uint32_t index = model.submesh_index + i;
-
-                DrawIndexedIndirectCommand cmd{};
-                cmd.index_count = vk.meshes_alloc[index].index_count;
-                cmd.instance_count = 1;
-                cmd.first_index = vk.meshes_alloc[index].first_index;
-                cmd.vertex_offset = vk.meshes_alloc[index].vertex_offset;
-                cmd.first_instance = model.base_instance + 1;
-
-                vk.indirect_cmds[vk.active_commands + i] = cmd;
-            }
-
-            uint64_t gpu_byte_offset = vk.active_commands * sizeof(DrawIndexedIndirectCommand);
-            size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
-            wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset, &vk.indirect_cmds[vk.active_commands], instance_upload_size);
-
-#ifdef __EMSCRIPTEN__
-            SetCursor("cursor_red.png");
-#endif
-        }
-    }
-
+    EvaluateAnimations(delta);
+    CheckMouseHover();
     UpdateGPU();
     Render();
-
-    double work_end = glfwGetTime();
-    double true_cpu_ms = (work_end - vk.last_time) * 1000.0;
+    //double work_end = glfwGetTime();
+    //double true_cpu_ms = (work_end - vk.last_time) * 1000.0;
 
     static double print_timer = 0.0;
     print_timer += delta;
     if (print_timer >= 1.0)
     {
-        printf("%.2f ms\n", true_cpu_ms);
+        //printf("%.2f cpu ms\n", true_cpu_ms);
         print_timer -= 1.0;
     }
 }

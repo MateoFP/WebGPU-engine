@@ -65,7 +65,6 @@ struct Input
 };
 struct Autos
 {
-    v3 origin;
     v3 position;
     v3 destination;
     v3 movement;
@@ -139,6 +138,7 @@ struct Entity
     v3 position;
     v3 destination;
     v3 movement;
+    v3 origin;
     bool moving;
     float angle;
     float speed;
@@ -154,9 +154,13 @@ struct Entity
     bool is_looping = true;
     bool in_range = false;
     bool can_move = true;
+    bool targeting = false;
 
     float trigger_time = 0.3f;
     bool triggered_this_loop = false;
+
+    float cast_time = 0.0f;
+    bool casted = false;
 
     float hp = 100.0f;
 };
@@ -228,25 +232,21 @@ struct EngineContext
     InstanceData                    instance_data[MAX_INSTANCES];
     InstanceDataUI                  instance_data_ui[MAX_INSTANCES_UI];
     InstanceDataWire                instance_data_wire[MAX_INSTANCES_WIRE];
-    uint32_t                        map_data[676] =
+    uint32_t                        map_data[169] =
     {
-0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
-0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0,
-1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1,
-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
-0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0,
-0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0,
-0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0,
-0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0,
-0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
-0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0,
-1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0,
-1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
-0, 0, 0, 0,
+        3,3,2,2,2,2,2,2,2,2,2,2,2,
+        3,1,1,1,0,0,0,0,0,0,0,0,2,
+        2,1,1,1,1,0,0,0,0,0,0,0,2,
+        2,1,1,1,1,1,0,0,0,0,0,0,2,
+        2,0,1,1,1,1,1,0,0,0,0,0,2,
+        2,0,0,1,1,1,1,1,0,0,0,0,2,
+        2,0,0,0,1,1,1,1,1,0,0,0,2,
+        2,0,0,0,0,1,1,1,1,1,0,0,2,
+        2,0,0,0,0,0,1,1,1,1,1,0,2,
+        2,0,0,0,0,0,0,1,1,1,1,1,2,
+        2,0,0,0,0,0,0,0,1,1,1,1,2,
+        2,0,0,0,0,0,0,0,0,1,1,1,3,
+        2,2,2,2,2,2,2,2,2,2,2,3,3,
     };
 
     uint32_t active_commands = 0;
@@ -278,6 +278,13 @@ struct GameContext
 {
     bool paused = true;
 };
+struct WebContext
+{
+    bool Connected;
+    uint8_t local_id;
+    uint8_t enemy_id;
+    double ping;
+};
 
 extern EngineContext vk;
 extern WindowContext win;
@@ -285,8 +292,7 @@ extern GameContext gc;
 extern GUBO gubo;
 extern Input input;
 extern Camera cam;
-extern Entity p1;
-extern Entity p2;
+extern Entity player[2];
 extern BoundingBox world_box;
 extern const char* plane_shader;
 extern const char* object_shader;
@@ -297,15 +303,30 @@ extern const char* outline_shader;
 void InitWorld();
 void InitVk();
 void UpdateGame(float delta);
+void Render();
+
 
 #ifdef __EMSCRIPTEN__
 
-struct WebContext
+#pragma pack(push, 1)
+struct WorldStateHeader
 {
-    bool Connected;
+    uint8_t opcode;
+    uint32_t server_tick;
+    uint8_t player_count;
 };
+struct ServerPlayerState
+{
+    uint8_t player_id;
+    float x, y;
+    float dx, dy;
+    float hp;
+    uint8_t status_flags;
+};
+#pragma pack(pop)
 
 extern WebContext web;
+extern ServerPlayerState player_states[2];
 
 extern "C"
 {
@@ -317,6 +338,10 @@ extern "C"
     void JS_ConnectToServer();
     void JS_ShowLobbyLink(const char* code_ptr);
     void JS_StartLobby();
+    void JS_SendInput(float x, float y, uint8_t action_key, uint8_t key_flags, uint8_t target_id);
+    void JS_Ping(double current_time);
+    void JS_InitPage();
+    void JS_CloseSocket();
 
 void FocusCanvas();
 void SetCursor(const char* path);
@@ -324,6 +349,8 @@ void OnEstablishedConnection();
 void OnLostConnection();
 void OnReceiveServerPacket(uint8_t* data, size_t byte_length);
 void StartLobby();
+void ProcessServerState(uint8_t* data, size_t len);
+void SetLocalID(uint8_t local_id);
 }
 
 #endif 

@@ -3,7 +3,7 @@ R"(
 
 struct MapData
 {
-    data : array<u32, 676>,
+    data : array<u32, 169>,
 };
 
 struct GUBO 
@@ -51,16 +51,36 @@ struct VertexOutput
 @group(0) @binding(3) var texture_sampler: sampler;
 @group(0) @binding(4) var<storage, read> map : MapData;
 
-const FLAG_STONE:   u32 = 1u << 0u;
+const FLAG_BRICK:   u32 = 1u << 0u; 
+const FLAG_FOG:     u32 = 1u << 1u;
 
-fn GetFlag(x: u32, y: u32, FLAG: u32) -> u32 
+fn GetFlag(x: u32, y: u32) -> u32 
 {
-    let cx = clamp(x, 0u, 25u);
-    let cy = clamp(y, 0u, 25u);
-    let index = (cy * 26u) + cx;
+    let cx = clamp(x, 0u, 12u);
+    let cy = clamp(y, 0u, 12u);
+    let index = (cy * 13u) + cx;
+    let flags = map.data[index];
 
-    let is_on = (map.data[index] & FLAG) != 0u;
-    return u32(is_on);
+    let is_brick = (flags & FLAG_BRICK) != 0u;
+    return u32(is_brick);
+}
+
+fn GetFogValue(x: u32, y: u32) -> f32 
+{
+    let cx = clamp(x, 0u, 12u);
+    let cy = clamp(y, 0u, 12u);
+    let index = (cy * 13u) + cx;
+    let flags = map.data[index];
+
+    let has_fog = (flags & FLAG_FOG) != 0u;
+    if(has_fog)
+    {
+        return 1.0f;
+    }
+    else
+    {
+        return 0.0f;
+    }
 }
 
     @vertex
@@ -83,44 +103,65 @@ fn GetFlag(x: u32, y: u32, FLAG: u32) -> u32
     @fragment
     fn fs_main(in: VertexOutput) -> @location(0) vec4f 
     {
-        let map_uv = in.uv * 25;
+        let map_uv = in.uv * 12;
         let tile_pos = vec2<i32>(floor(map_uv));
         let local_tile_uv = vec2<f32>(1.0) - fract(map_uv);
        
         let x = u32(tile_pos.x);
         let y = u32(tile_pos.y);
 
-        let v_bl = GetFlag(x,      y,       FLAG_STONE);
-        let v_br = GetFlag(x + 1u, y,       FLAG_STONE);
-        let v_tl = GetFlag(x,      y + 1u,  FLAG_STONE);
-        let v_tr = GetFlag(x + 1u, y + 1u,  FLAG_STONE);
+        let v_bl = GetFlag(x, y);
+        let v_br = GetFlag(x + 1u, y);
+        let v_tl = GetFlag(x, y + 1u);
+        let v_tr = GetFlag(x + 1u, y + 1u);
 
         let tile_mask = (v_tl * 1u) | (v_tr * 2u) | (v_bl * 4u) | (v_br * 8u);
 
-        let stone_color = textureSample(texture_array, texture_sampler, local_tile_uv, i32(1));
-        let dirt_color  = textureSample(texture_array, texture_sampler, local_tile_uv, i32(2)); 
+        let ddx = dpdx(map_uv);
+        let ddy = dpdy(map_uv);
+
+        let brick_color = textureSampleGrad(texture_array, texture_sampler, local_tile_uv, i32(2), ddx, ddy);
+        let grass_color  = textureSampleGrad(texture_array, texture_sampler, local_tile_uv, i32(1), ddx, ddy); 
         var out_color: vec4<f32>;
  
         if(tile_mask == 0)
         {
-            out_color =  stone_color;
+            out_color =  grass_color;
         }
-        else if(tile_mask == 15)
+        else if(tile_mask == 10)
         {
-            out_color =  dirt_color;
+            out_color =  brick_color;
         }
         else
         {
             let slot_offset = vec2<f32>(f32(tile_mask / 4u), f32(tile_mask % 4u));
             let alpha_uv = (slot_offset + local_tile_uv) * 0.25;
-        
             let atlas_size = vec2<f32>(textureDimensions(texture_array, 0i)); 
             let pixel_coord = vec2<i32>(alpha_uv * atlas_size);
-
             let raw_mask = textureLoad(texture_array, pixel_coord, 0i, 0i).r;
-            out_color = mix(stone_color, dirt_color, raw_mask);
+            out_color = mix(grass_color, brick_color, raw_mask);
         }
 
+        let fog_uv = in.uv * 13.0;
+        let sample_pos = fog_uv - vec2<f32>(0.5);
+        let fog_pos = vec2<i32>(floor(sample_pos));
+        let local_fog_uv = fract(sample_pos);
+
+        let fx = u32(fog_pos.x);
+        let fy = u32(fog_pos.y);
+
+        let f_bl = GetFogValue(fx, fy);
+        let f_br = GetFogValue(fx + 1, fy);
+        let f_tl = GetFogValue(fx, fy + 1);
+        let f_tr = GetFogValue(fx + 1, fy + 1);
+
+        let fog_top     = mix(f_tl, f_tr, local_fog_uv.x);
+        let fog_bottom  = mix(f_bl, f_br, local_fog_uv.x);
+        let fog_factor  = mix(fog_bottom, fog_top, local_fog_uv.y);
+        let fog_color = vec3<f32>(0.0, 0.0, 0.0);
+
+        out_color = vec4<f32>(mix(out_color.rgb, fog_color, fog_factor), out_color.a);
+        
         if(gubo.debug == 1)
         {
             let line_thickness = 0.02;
@@ -145,7 +186,7 @@ struct BoneBuffer
 
 struct MapData
 {
-    data : array<u32, 676>,
+    data : array<u32, 169>,
 };
 
 struct GUBO 
@@ -183,7 +224,29 @@ struct VertexOutput
 	@location(0) uv: vec2f,
     @location(1) color: vec3f,
     @location(2) @interpolate(flat) texture_index: u32,
+    @location(3) w_pos : vec4f,
 };
+
+const FLAG_BRICK:   u32 = 1u << 0u; 
+const FLAG_FOG:     u32 = 1u << 1u;
+
+fn GetFogValue(x: u32, y: u32) -> f32 
+{
+    let cx = clamp(x, 0u, 12u);
+    let cy = clamp(y, 0u, 12u);
+    let index = (cy * 13u) + cx;
+    let flags = map.data[index];
+
+    let has_fog = (flags & FLAG_FOG) != 0u;
+    if(has_fog)
+    {
+        return 1.0f;
+    }
+    else
+    {
+        return 0.0f;
+    }
+}
 
 @group(0) @binding(0) var<uniform> gubo : GUBO;
 @group(0) @binding(1) var<storage, read> instances : array<InstanceData>;
@@ -211,8 +274,8 @@ struct VertexOutput
             pos_local = skinMatrix * pos_local;
         }
 
-        let pos_world = instance.matrix * pos_local;
-        out.position = gubo.projView * pos_world;
+        out.w_pos = instance.matrix * pos_local;
+        out.position = gubo.projView * out.w_pos;
         out.uv = in.uv;
         out.color = instance.color.xyz;
         out.texture_index = instance.id;
@@ -222,15 +285,41 @@ struct VertexOutput
     @fragment
     fn fs_main(in: VertexOutput) -> @location(0) vec4f 
     {
-        let color = textureSample(texture_array, texture_sampler, in.uv, i32(in.texture_index));
+        var out_color: vec4<f32>;
+        out_color = textureSample(texture_array, texture_sampler, in.uv, i32(in.texture_index));
         
-        if (color.a < 0.1) 
+        let world_min= vec2<f32>(0,0);
+        let world_size = vec2<f32>(50,50);
+        var map_uv = (in.w_pos.xy - world_min) / world_size;
+        map_uv = clamp(map_uv, vec2<f32>(0.0), vec2<f32>(1.0));
+
+        let fog_uv = map_uv * 13;
+        let sample_pos = fog_uv - vec2<f32>(0.5);
+        let fog_pos = vec2<i32>(floor(sample_pos));
+        let local_fog_uv = fract(sample_pos);
+
+        let fx = u32(fog_pos.x);
+        let fy = u32(fog_pos.y);
+
+        let f_bl = GetFogValue(fx, fy);
+        let f_br = GetFogValue(fx + 1, fy);
+        let f_tl = GetFogValue(fx, fy + 1);
+        let f_tr = GetFogValue(fx + 1, fy + 1);
+
+        let fog_top     = mix(f_tl, f_tr, local_fog_uv.x);
+        let fog_bottom  = mix(f_bl, f_br, local_fog_uv.x);
+        let fog_factor  = mix(fog_bottom, fog_top, local_fog_uv.y);
+        let fog_color = vec3<f32>(0.0, 0.0, 0.0);
+
+        out_color = vec4<f32>(mix(out_color.rgb, fog_color, fog_factor), out_color.a);
+
+        if (out_color.a < 0.1) 
         {
             discard;
         }
 
-        let corrected_rgb = pow(color.rgb, vec3f(1.0 / 2.2));   
-        return vec4f(corrected_rgb, color.a);                   
+        let corrected_rgb = pow(out_color.rgb, vec3f(1.0 / 2.2));   
+        return vec4f(corrected_rgb, out_color.a);                   
     }
 )";
 
@@ -285,7 +374,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     let unit_pos = unit_quad[vertex_index];
     let local_size = unit_pos * instance.size;
 
-    var pixel_pos = instance.pos + vec2f(unit_pos.x * instance.size.x, unit_pos.y * instance.size.y);
+    var pixel_pos = floor(instance.pos + vec2f(unit_pos.x * instance.size.x, unit_pos.y * instance.size.y) + 0.5);
 
     let atlas_size = vec2<f32>(512.0, 512.0);
     let uv_size = instance.size / atlas_size;

@@ -35,11 +35,9 @@
 </head>
 <body>
 
-    <div id="lobby-ui">
-        <h3 style="margin-top: 0;">1v1</h3>
-        
+    <div id="lobby-ui">	
         <div id="connecting-section">
-            <p style="color: #f39c12; font-size: 14px; margin: 10px 0;">Connecting to server...</p>
+            <p id="connecting-status" style="color: #f39c12; font-size: 14px; margin: 10px 0;">Connecting to server...</p>
         </div>
 
         <div id="generator-section" style="display: none;">
@@ -47,10 +45,8 @@
         </div>
 
         <div id="link-section" style="display: none;">
-            <p style="font-size: 13px; color: #ccc; margin-bottom: 8px;">Share this link with your opponent:</p>
             <input type="text" id="invite-link-input" readonly style="padding: 6px; width: 220px; border-radius: 4px; border: 1px solid #444; background: #111; color: white;" />
             <button id="copy-btn" style="padding: 6px 12px; cursor: pointer; background: #2ed573; color: white; border: none; border-radius: 4px;">Copy</button>
-            <p style="font-size: 11px; color: #aaa; margin: 8px 0 0 0;">Waiting for opponent to connect...</p>
         </div>
     </div>
 
