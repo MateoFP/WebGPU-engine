@@ -14,7 +14,7 @@ void MainLoop()
     double current_time = glfwGetTime();
     vk.frame_delta = current_time - vk.last_time;
     vk.last_time = current_time;
-    if (vk.frame_delta > 0.033) vk.frame_delta = 0.033;
+    if (vk.frame_delta > 0.1) vk.frame_delta = 0.1;
     gubo.time += vk.frame_delta;
 
     if (!web.Connected)

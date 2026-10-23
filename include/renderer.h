@@ -162,6 +162,11 @@ struct Entity
     float cast_time = 0.0f;
     bool casted = false;
 
+    float blend_weight = 1.0f;    
+    float blend_duration = 0.07f;
+    uint32_t prev_anim_id = 0;
+    double prev_anim_time = 0.0;
+
     float hp = 100.0f;
 };
 struct Vertex
@@ -280,9 +285,10 @@ struct GameContext
 };
 struct WebContext
 {
-    bool Connected;
+    bool Connected = false;
     uint8_t local_id;
     uint8_t enemy_id;
+    bool has_match_started = false;
     double ping;
 };
 
@@ -305,7 +311,6 @@ void InitVk();
 void UpdateGame(float delta);
 void Render();
 
-
 #ifdef __EMSCRIPTEN__
 
 #pragma pack(push, 1)
@@ -327,6 +332,8 @@ struct ServerPlayerState
 
 extern WebContext web;
 extern ServerPlayerState player_states[2];
+extern const char* yellow;
+extern const char* red;
 
 extern "C"
 {
@@ -342,6 +349,7 @@ extern "C"
     void JS_Ping(double current_time);
     void JS_InitPage();
     void JS_CloseSocket();
+    void JS_PresentError(const char* error_msg, const char* msg_color);
 
 void FocusCanvas();
 void SetCursor(const char* path);

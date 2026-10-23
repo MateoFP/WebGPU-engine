@@ -39,8 +39,6 @@ enum in_opcode : uint8_t
     PONG = 50,
     LOBBY_DESTROYED = 51,
     LOBBY_CODE = 52,
-    START_LOBBY = 53,
-    NO_LOBBY_FOUND = 54,
     SERVER_STATE = 55,
 };
 enum out_opcode : uint8_t
@@ -61,7 +59,10 @@ Entity player[2] = {};
 BoundingBox world_box = {};
 
 WebContext web = {};
+
 #ifdef __EMSCRIPTEN__
+const char* yellow = "#f39c12";
+const char* red = "#ff4444";
 
 ServerPlayerState player_states[2];
 
@@ -98,6 +99,40 @@ EM_JS(void, JS_CloseSocket, (),
         }
         window.history.replaceState({}, document.title, window.location.pathname);
     });
+
+EM_JS(void, JS_PresentError, (const char* error_msg, const char* msg_color),
+    {
+        window.fatalErrorOccurred = true;
+
+        const message = UTF8ToString(error_msg);
+        const color = UTF8ToString(msg_color);
+
+        console.error("Fatal Error:", message);
+
+        const connectingSec = document.getElementById("connecting-section");
+        const statusText = document.getElementById("connecting-status");
+        const genSec = document.getElementById("generator-section");
+        const lobbyUi = document.getElementById("lobby-ui");
+
+        if (connectingSec)
+        {
+            connectingSec.style.display = "block";
+        }
+        if (statusText)
+        {
+            statusText.innerText = message;
+            statusText.style.color = color;
+        }
+        if (genSec)
+        {
+            genSec.style.display = "none";
+        }
+        if (lobbyUi)
+        {
+            lobbyUi.style.display = "block";
+        }
+    });
+
 
 extern "C"
 {
@@ -197,7 +232,7 @@ extern "C"
 
         switch (opcode)
         {
-            case PONG:
+            case PING:
             {
                 if (byte_length >= sizeof(9)) //PingPacket is 9 
                 {
@@ -215,17 +250,21 @@ extern "C"
                 std::string lobby_code(reinterpret_cast<char*>(data + 1), byte_length - 1);
                 JS_ShowLobbyLink(lobby_code.c_str());
             } break;
-            case START_LOBBY:
-            {
-                JS_StartLobby();
-            } break;
             case SERVER_STATE:
             {
+                if (web.has_match_started == false)
+                {
+                    web.has_match_started = true;
+                    JS_StartLobby();
+                }
                 ProcessServerState(data, byte_length);
             } break;
             case LOBBY_DESTROYED:
             {
                 JS_CloseSocket();
+                web.Connected = false;
+                gc.paused = true;
+                JS_PresentError("Lobby closed.", yellow);
             } break;
             default:
             {
@@ -396,6 +435,8 @@ EM_JS(void, JS_ConnectToServer, (),
 
     globalThis.pkerSocket.onclose = (event) => 
     {
+        if (window.fatalErrorOccurred) return;
+
         console.warn("Connection closed. Code:", event.code, "Reason:", event.reason);
 
         const connectingSec = document.getElementById("connecting-section");
@@ -747,7 +788,7 @@ void UpdateGPU()
     vk.instance_data[vk.model_meshes[2].base_instance].color = { 0.0f, 0.0f, 0.0f , 1.0f };
 
     vk.instance_data[vk.model_meshes[2].base_instance + 1].matrix = TSR({ player[web.enemy_id].position.x, player[web.enemy_id].position.y, 0.2f }, 1.0f, player[web.enemy_id].angle);
-    vk.instance_data[vk.model_meshes[2].base_instance + 1].id = 3;
+    vk.instance_data[vk.model_meshes[2].base_instance + 1].id = 5;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].skinned = 1;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].bone_offset = 33;
     vk.instance_data[vk.model_meshes[2].base_instance + 1].color = { 0.0f, 0.0f, 0.0f , 1.0f };
@@ -820,6 +861,16 @@ void UpdateGPU()
 void UpdateEntityAnimation(Entity* entity, float delta)
 {
     entity->anim_time += (double)delta * entity->anim_speed;
+    if (entity->blend_weight < 1.0f)
+    {
+        entity->blend_weight += delta / entity->blend_duration;
+        if (entity->blend_weight > 1.0f) 
+        {
+            entity->blend_weight = 1.0f;
+        }
+        entity->prev_anim_time += delta;
+    }
+
     ufbx_anim* current_anim = entity->model_mesh->animation[entity->current_anim_id];
 
     if (current_anim)
@@ -856,9 +907,14 @@ void SetEntityAnimation(Entity* entity, uint32_t new_anim_id, bool loop)
 {
     if (entity->current_anim_id != new_anim_id)
     {
+        entity->prev_anim_id = entity->current_anim_id;
+        entity->prev_anim_time = entity->anim_time;
+
         entity->current_anim_id = new_anim_id;
         entity->anim_time = 0.0;
         entity->is_looping = loop;
+
+        entity->blend_weight = 0.0f;
     }
 }
 
@@ -880,8 +936,8 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             if (action == GLFW_PRESS)
             {
-                player[web.local_id].moving = false;
-                player[web.local_id].destination = player[web.local_id].position;
+                //player[web.local_id].moving = false;
+                //player[web.local_id].destination = player[web.local_id].position;
                 #ifdef __EMSCRIPTEN__
                 JS_SendInput(0.0f, 0.0f, KEY_S, PRESSED, 2);
                 #endif  
@@ -913,7 +969,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             if (action == GLFW_PRESS)
             {
-                input.a.pressed = true;
+                //input.a.pressed = true;
             }
         } break;
     }
@@ -935,6 +991,10 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
                 if (input.collision.hit)
                 {
                     player[web.local_id].destination = input.collision.point;
+                    player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+
+                    /*
+                    player[web.local_id].destination = input.collision.point;
                     player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
                     player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
                     player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
@@ -953,6 +1013,7 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
                         player[web.local_id].moving = true;
                         player[web.local_id].targeting = true;
                     }
+                    */
                     #ifdef __EMSCRIPTEN__
                     JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, web.enemy_id);
                     #endif 
@@ -961,7 +1022,8 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
                 {
                     input.collision = GetRayCollisionBox(input.ray, world_box);
                     if (!input.collision.hit) break;
-
+                    player[web.local_id].destination = input.collision.point;
+                    /*
                     player[web.local_id].destination = input.collision.point;
                     player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
                     player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
@@ -971,7 +1033,7 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
                     player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
                     player[web.local_id].moving = true;
                     player[web.local_id].targeting = false;
-
+                    */
                     #ifdef __EMSCRIPTEN__
                     JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, 2);
                     #endif  
@@ -984,6 +1046,7 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
             {
                 if (input.a.pressed)
                 {
+                    /*
                     input.collision = GetRayCollisionBox(input.ray, player[web.enemy_id].bb);
                     if (!input.collision.hit) break;
 
@@ -996,6 +1059,7 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
                     player[web.local_id].moving = false;
                     SetEntityAnimation(&player[web.local_id], 3, true);
                     input.a.pressed = false;
+                    */
                 }
             }
         } break;
@@ -1067,6 +1131,10 @@ void AdapterCallback(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUS
     if (adapter == nullptr)
     {
         std::cerr << "failed to find adapter." << std::endl;
+#ifdef __EMSCRIPTEN__
+        JS_CloseSocket();
+        JS_PresentError("Turn on hardware/graphics acceleration.", red);
+#endif
         PrintString(message);
         return;
     }
@@ -1314,7 +1382,7 @@ void LoadTextures()
     offset++;
     LoadTexture("assets/tree.png", offset, 10);
     offset++;
-    LoadTexture("assets/stone_blue.png", offset, 10);
+    LoadTexture("assets/player_red.png", offset, 10);
     offset++;
     LoadTexture("assets/atlas_ui.png", offset, 1);
 }
@@ -1799,13 +1867,15 @@ void GetBoneMatrices(Entity* player)
 {
     vk.bones_data.clear();
     ModelMeshes* mesh = player->model_mesh;
-    ufbx_evaluate_opts opts = { 0 };
+    if (!mesh->mesh || mesh->mesh->skin_deformers.count == 0) return;
 
-    ufbx_scene* eval = ufbx_evaluate_scene(mesh->scene, mesh->animation[player->current_anim_id], player->anim_time, &opts, NULL);
+    ufbx_skin_deformer* skin = mesh->mesh->skin_deformers.data[0];
+    ufbx_anim* curr_anim = mesh->animation[player->current_anim_id];
 
-    if (mesh->mesh && mesh->mesh->skin_deformers.count > 0)
+    if (player->blend_weight >= 1.0f || player->prev_anim_id == player->current_anim_id)
     {
-        ufbx_skin_deformer* skin = mesh->mesh->skin_deformers.data[0];
+        ufbx_evaluate_opts opts = { 0 };
+        ufbx_scene* eval = ufbx_evaluate_scene(mesh->scene, curr_anim, player->anim_time, &opts, NULL);
 
         for (size_t b = 0; b < skin->clusters.count; ++b)
         {
@@ -1814,7 +1884,6 @@ void GetBoneMatrices(Entity* player)
             ufbx_matrix skin_mat = ufbx_matrix_mul(&bone_world, &cluster->geometry_to_bone);
 
             mat4 bones = {};
-
             bones.column[0] = { (float)skin_mat.cols[0].x, (float)skin_mat.cols[0].y, (float)skin_mat.cols[0].z, 0.0f };
             bones.column[1] = { (float)skin_mat.cols[1].x, (float)skin_mat.cols[1].y, (float)skin_mat.cols[1].z, 0.0f };
             bones.column[2] = { (float)skin_mat.cols[2].x, (float)skin_mat.cols[2].y, (float)skin_mat.cols[2].z, 0.0f };
@@ -1822,6 +1891,47 @@ void GetBoneMatrices(Entity* player)
 
             vk.bones_data.push_back(bones);
         }
+        ufbx_free_scene(eval);
+    }
+    else
+    {
+        ufbx_anim* prev_anim = mesh->animation[player->prev_anim_id];
+        ufbx_evaluate_opts opts = { 0 };
+
+        ufbx_scene* eval_prev = ufbx_evaluate_scene(mesh->scene, prev_anim, player->prev_anim_time, &opts, NULL);
+        ufbx_scene* eval_curr = ufbx_evaluate_scene(mesh->scene, curr_anim, player->anim_time, &opts, NULL);
+
+        float w = player->blend_weight;
+        float inv_w = 1.0f - w;
+
+        for (size_t b = 0; b < skin->clusters.count; ++b)
+        {
+            ufbx_skin_cluster* cluster = skin->clusters.data[b];
+
+            ufbx_matrix bone_prev = eval_prev->nodes.data[cluster->bone_node->typed_id]->node_to_world;
+            ufbx_matrix skin_prev = ufbx_matrix_mul(&bone_prev, &cluster->geometry_to_bone);
+
+            ufbx_matrix bone_curr = eval_curr->nodes.data[cluster->bone_node->typed_id]->node_to_world;
+            ufbx_matrix skin_curr = ufbx_matrix_mul(&bone_curr, &cluster->geometry_to_bone);
+
+            mat4 bones = {};
+            for (int c = 0; c < 3; ++c)
+            {
+                bones.column[c].x = (float)(skin_prev.cols[c].x * inv_w + skin_curr.cols[c].x * w);
+                bones.column[c].y = (float)(skin_prev.cols[c].y * inv_w + skin_curr.cols[c].y * w);
+                bones.column[c].z = (float)(skin_prev.cols[c].z * inv_w + skin_curr.cols[c].z * w);
+                bones.column[c].w = 0.0f;
+            }
+            bones.column[3].x = (float)(skin_prev.cols[3].x * inv_w + skin_curr.cols[3].x * w);
+            bones.column[3].y = (float)(skin_prev.cols[3].y * inv_w + skin_curr.cols[3].y * w);
+            bones.column[3].z = (float)(skin_prev.cols[3].z * inv_w + skin_curr.cols[3].z * w);
+            bones.column[3].w = 1.0f;
+
+            vk.bones_data.push_back(bones);
+        }
+
+        ufbx_free_scene(eval_prev);
+        ufbx_free_scene(eval_curr);
     }
 
     uint64_t gpu_byte_offset = (uint64_t)player->instance_data.bone_offset * sizeof(mat4);
@@ -1829,11 +1939,8 @@ void GetBoneMatrices(Entity* player)
     uint32_t upload_size = sizeof(mat4) * vk.bones_data.size();
 
     wgpuQueueWriteBuffer(vk.queue, vk.bones_buffer.buffer, gpu_byte_offset, cpu_data_pointer, upload_size);
-
-    ufbx_free_scene(eval);
 }
 
-float alpha = 1.0f - expf(-15.0f * vk.physics_dt);
 void UpdateCamPosition()
 {
     if ((input.mouse_pos.x < 30) && (cam.pos.x > 5.0))
@@ -1866,22 +1973,50 @@ void UpdateCamPosition()
     input.ray.position = { cam.pos };
 }
 void UpdatePositions()
-{
-    if (player[web.local_id].moving)
+{   
+#ifdef __EMSCRIPTEN__
+    if (player_states[web.local_id].status_flags & IS_DEAD)
     {
-        float dist = v2_distance({ player[web.local_id].position.x, player[web.local_id].position.y },
-            { player[web.local_id].destination.x, player[web.local_id].destination.y });
+        player[web.local_id].moving = false;
+        player[web.local_id].targeting = false;
+        player[web.local_id].position = player[web.local_id].origin;
+        return;
+    }
 
-        if (dist > 0.1f)
+    float alpha = 1.0f - expf(-40.0f * vk.frame_delta);
+    float target_x = player_states[web.local_id].x;
+    float target_y = player_states[web.local_id].y;
+    player[web.local_id].position.x += (target_x - player[web.local_id].position.x) * alpha;
+    player[web.local_id].position.y += (target_y - player[web.local_id].position.y) * alpha;
+
+    if (player_states[web.local_id].status_flags & IS_CASTING)
+    {
+        if (player[web.local_id].current_anim_id != 3)
         {
-            player[web.local_id].movement.x = player[web.local_id].destination.x - player[web.local_id].position.x;
-            player[web.local_id].movement.y = player[web.local_id].destination.y - player[web.local_id].position.y;
-            player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
-            player[web.local_id].movement *= player[web.local_id].speed;
-
-            player[web.local_id].position += player[web.local_id].movement;
+            SetEntityAnimation(&player[web.local_id], 3, true);
         }
-        else { player[web.local_id].moving = false; }
+
+        player[web.local_id].movement.x = player[web.enemy_id].position.x - player[web.local_id].position.x;
+        player[web.local_id].movement.y = player[web.enemy_id].position.y - player[web.local_id].position.y;
+        player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+        player[web.local_id].movement *= player[web.local_id].speed;
+
+        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+        player[web.local_id].moving = false;
+    }
+    else if (player_states[web.local_id].status_flags & IS_MOVING)
+    {
+        player[web.local_id].movement.x = player_states[web.local_id].dx - player[web.local_id].position.x;
+        player[web.local_id].movement.y = player_states[web.local_id].dy - player[web.local_id].position.y;
+        player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
+        player[web.local_id].movement *= player[web.local_id].speed;
+
+        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
+        player[web.local_id].moving = true;
+    }
+    else
+    {
+        player[web.local_id].moving = false;
     }
 
     if (!player[web.local_id].autos.moving)
@@ -1901,84 +2036,44 @@ void UpdatePositions()
             { player[web.enemy_id].position.x, player[web.enemy_id].position.y }) <= 1.0f)
         {
             player[web.local_id].autos.moving = false;
-            player[web.local_id].autos.position = player[web.local_id].position;
+            player[web.local_id].autos.position = player[web.enemy_id].position;
         }
     }
-
-#ifdef __EMSCRIPTEN__
-
-    float dist_from_server = v2_distance(
-        { player[web.local_id].position.x, player[web.local_id].position.y },
-        { player_states[web.local_id].x, player_states[web.local_id].y });
-
-    if (dist_from_server > 10.0f)
-    {
-        player[web.local_id].position.x = player_states[web.local_id].x;
-        player[web.local_id].position.y = player_states[web.local_id].y;
-        cam.pos = { player[web.local_id].position.x, player[web.local_id].position.y - 15.0f, 35.0f };
-        cam.look_at = { player[web.local_id].position.x, player[web.local_id].position.y + 1.0f, 1.0f };
-    }
-    else
-    {
-        player[web.local_id].position.x += (player_states[web.local_id].x - player[web.local_id].position.x) * alpha;
-        player[web.local_id].position.y += (player_states[web.local_id].y - player[web.local_id].position.y) * alpha;
-    }
-
-    if (player_states[web.local_id].status_flags & IS_DEAD)
-    {
-        player[web.local_id].moving = false;
-        player[web.local_id].targeting = false;
-        player[web.local_id].position = player[web.local_id].origin;
-    }
-
-    if (player_states[web.local_id].status_flags & IS_CASTING)
-    {
-        player[web.local_id].movement.x = player[web.enemy_id].position.x - player[web.local_id].position.x;
-        player[web.local_id].movement.y = player[web.enemy_id].position.y - player[web.local_id].position.y;
-        player[web.local_id].movement = v3_normalize(player[web.local_id].movement);
-        player[web.local_id].movement *= player[web.local_id].speed;
-
-        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
-        player[web.local_id].moving = false;
-    }
-    else if (player_states[web.local_id].status_flags & IS_MOVING)
-    {
-        player[web.local_id].moving = true;
-        player[web.local_id].angle = (atan2f(player[web.local_id].movement.y, player[web.local_id].movement.x)) + 1.5708;
-    }
-
-#endif
-
-    if ((v2_distance({ player[web.local_id].position.x, player[web.local_id].position.y },
-        { player[web.enemy_id].position.x, player[web.enemy_id].position.y }) <= 10.0f) && (player[web.local_id].targeting))
-    {
-        player[web.local_id].moving = false;
-        player[web.local_id].targeting = false;
-
-        #ifdef __EMSCRIPTEN__
-        JS_SendInput(player[web.local_id].destination.x, player[web.local_id].destination.y, MBR, PRESSED, web.enemy_id);
-        #endif      
-    }
+#endif 
 }
 void UpdateEnemy()
 {
 #ifdef __EMSCRIPTEN__
-    float enemy_dist_from_server = v2_distance(
-        { player[web.enemy_id].position.x, player[web.enemy_id].position.y },
-        { player_states[web.enemy_id].x, player_states[web.enemy_id].y });
-
-    if (enemy_dist_from_server > 10.0f)
+    if (player_states[web.enemy_id].status_flags & IS_DEAD)
     {
-        player[web.enemy_id].position.x = player_states[web.enemy_id].x;
-        player[web.enemy_id].position.y = player_states[web.enemy_id].y;
-    }
-    else
-    {
-        player[web.enemy_id].position.x += (player_states[web.enemy_id].x - player[web.enemy_id].position.x) * alpha;
-        player[web.enemy_id].position.y += (player_states[web.enemy_id].y - player[web.enemy_id].position.y) * alpha;
+        player[web.enemy_id].moving = false;
+        player[web.enemy_id].targeting = false;
+        player[web.enemy_id].position = player[web.enemy_id].origin;
+        return;
     }
 
-    if (player_states[web.enemy_id].status_flags & IS_MOVING)
+    float alpha = 1.0f - expf(-40.0f * vk.frame_delta);
+    float target_x = player_states[web.enemy_id].x;
+    float target_y = player_states[web.enemy_id].y;
+    player[web.enemy_id].position.x += (target_x - player[web.enemy_id].position.x) * alpha;
+    player[web.enemy_id].position.y += (target_y - player[web.enemy_id].position.y) * alpha;
+
+    if (player_states[web.enemy_id].status_flags & IS_CASTING)
+    {
+        if (player[web.enemy_id].current_anim_id != 3)
+        {
+            SetEntityAnimation(&player[web.enemy_id], 3, true);
+        }
+
+        player[web.enemy_id].movement.x = player[web.local_id].position.x - player[web.enemy_id].position.x;
+        player[web.enemy_id].movement.y = player[web.local_id].position.y - player[web.enemy_id].position.y;
+        player[web.enemy_id].movement = v3_normalize(player[web.enemy_id].movement);
+        player[web.enemy_id].movement *= player[web.enemy_id].speed;
+
+        player[web.enemy_id].angle = (atan2f(player[web.enemy_id].movement.y, player[web.enemy_id].movement.x)) + 1.5708;
+        player[web.enemy_id].moving = false;
+    }
+    else if (player_states[web.enemy_id].status_flags & IS_MOVING)
     {
         player[web.enemy_id].movement.x = player_states[web.enemy_id].dx - player[web.enemy_id].position.x;
         player[web.enemy_id].movement.y = player_states[web.enemy_id].dy - player[web.enemy_id].position.y;
@@ -1990,22 +2085,6 @@ void UpdateEnemy()
     }
     else
     {
-        player[web.enemy_id].moving = false;
-    }
-
-    if ((player_states[web.enemy_id].status_flags & IS_CASTING) && (player[web.enemy_id].current_anim_id != 3))
-    {
-        SetEntityAnimation(&player[web.enemy_id], 3, true);
-    }
-
-    if (player_states[web.enemy_id].status_flags & IS_CASTING)
-    {
-        player[web.enemy_id].movement.x = player[web.local_id].position.x - player[web.enemy_id].position.x;
-        player[web.enemy_id].movement.y = player[web.local_id].position.y - player[web.enemy_id].position.y;
-        player[web.enemy_id].movement = v3_normalize(player[web.enemy_id].movement);
-        player[web.enemy_id].movement *= player[web.enemy_id].speed;
-
-        player[web.enemy_id].angle = (atan2f(player[web.enemy_id].movement.y, player[web.enemy_id].movement.x)) + 1.5708;
         player[web.enemy_id].moving = false;
     }
 
@@ -2029,42 +2108,33 @@ void UpdateEnemy()
             player[web.enemy_id].autos.position = player[web.local_id].position;
         }
     }
-
-    if (player_states[web.enemy_id].status_flags & IS_DEAD)
-    {
-        player[web.enemy_id].moving = false;
-        player[web.enemy_id].targeting = false;
-        player[web.enemy_id].position = player[web.enemy_id].origin;
-    }
 #endif 
 }
 void EvaluateAnimations(float delta)
 {
-    if (player[web.local_id].moving)
-    {
-        SetEntityAnimation(&player[web.local_id], 4, true);
-    }
 #ifdef __EMSCRIPTEN__
-    else if (player_states[web.local_id].status_flags & IS_CASTING)
+
+    if(player_states[web.local_id].status_flags & IS_CASTING)
     {
         SetEntityAnimation(&player[web.local_id], 3, true);
     }
-#endif
+    else if (player_states[web.local_id].status_flags & IS_MOVING)
+    {
+        SetEntityAnimation(&player[web.local_id], 4, true);
+    }
     else
     {
         SetEntityAnimation(&player[web.local_id], 1, true);
     }
 
-    if (player[web.enemy_id].moving)
-    {
-        SetEntityAnimation(&player[web.enemy_id], 4, true);
-    }
-#ifdef __EMSCRIPTEN__
-    else if (player_states[web.enemy_id].status_flags & IS_CASTING)
+    if (player_states[web.enemy_id].status_flags & IS_CASTING)
     {
         SetEntityAnimation(&player[web.enemy_id], 3, true);
     }
-#endif
+    else if (player_states[web.enemy_id].status_flags & IS_MOVING)
+    {
+        SetEntityAnimation(&player[web.enemy_id], 4, true);
+    }
     else
     {
         SetEntityAnimation(&player[web.enemy_id], 1, true);
@@ -2078,14 +2148,20 @@ void EvaluateAnimations(float delta)
 
     CheckAnimationEvents(&player[web.local_id], delta);
     CheckAnimationEvents(&player[web.enemy_id], delta);
+#endif
 }
 void CheckMouseHover()
 {
+    static uint32_t current_cursor_state = 0;
+    uint32_t new_cursor_state = 0;
+
     input.ray.direction = RayCast(input.mouse_pos.x, input.mouse_pos.y,
                                   cam.view, cam.proj, (float)win.extent_x, (float)win.extent_y);
     input.collision = GetRayCollisionBox(input.ray, player[web.enemy_id].bb);
     if (!input.collision.hit)
     {
+        vk.hovering = false;
+
         ModelMeshes model = vk.model_meshes[2];
         if (vk.indirect_cmds[vk.active_commands].index_count != 0)
         {
@@ -2099,14 +2175,12 @@ void CheckMouseHover()
             size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
             wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset,
                 &vk.indirect_cmds[vk.active_commands], instance_upload_size);
-#ifdef __EMSCRIPTEN__
-            SetCursor("cursor.png");
-#endif
         }
     }
     else
     {
         vk.hovering = true;
+        new_cursor_state = 1;
 
         if (vk.indirect_cmds[vk.active_commands].index_count == 0)
         {
@@ -2129,11 +2203,24 @@ void CheckMouseHover()
             size_t instance_upload_size = model.submesh_count * sizeof(DrawIndexedIndirectCommand);
             wgpuQueueWriteBuffer(vk.queue, vk.indirect_buffer.buffer, gpu_byte_offset,
                 &vk.indirect_cmds[vk.active_commands], instance_upload_size);
-#ifdef __EMSCRIPTEN__
-            SetCursor("cursor_red.png");
-#endif
         }
     }
+    
+    #ifdef __EMSCRIPTEN__
+    if (new_cursor_state != current_cursor_state)
+    {
+        current_cursor_state = new_cursor_state;
+
+        if (current_cursor_state == 0)
+        {
+            SetCursor("cursor.png");
+        }
+        else if (current_cursor_state == 1)
+        {
+            SetCursor("cursor_red.png");
+        }
+    }
+    #endif
 }
 void Render()
 {
@@ -2360,21 +2447,11 @@ void InitVk()
     if (vk.adapter == nullptr)
     {
         std::cerr << "could not request adapter." << std::endl;
+
         return;
     }
     std::cout << "adapter: ";
 
-    /*
-    WGPUAdapterInfo  adapter_info = {};
-    if (wgpuAdapterGetInfo(vk.adapter, &adapter_info) == WGPUStatus_Success)
-    {
-        PrintString(adapter_info.vendor);
-        std::cout << ", ";
-        PrintString(adapter_info.architecture);
-        std::cout << " ";
-        wgpuAdapterInfoFreeMembers(adapter_info);
-    }
-    */
     WGPULimits adapter_limits = {};
     if (wgpuAdapterGetLimits(vk.adapter, &adapter_limits) == WGPUStatus_Success)
     {
@@ -2512,9 +2589,9 @@ void UpdateGame(float delta)
 
     while (vk.accumulator >= vk.physics_dt)
     {
-        UpdateCamPosition();
         UpdatePositions();
         UpdateEnemy();
+        UpdateCamPosition();
         vk.accumulator -= vk.physics_dt;
     }
 
@@ -2522,14 +2599,15 @@ void UpdateGame(float delta)
     CheckMouseHover();
     UpdateGPU();
     Render();
-    //double work_end = glfwGetTime();
-    //double true_cpu_ms = (work_end - vk.last_time) * 1000.0;
+    double work_end = glfwGetTime();
+    double true_cpu_ms = (work_end - vk.last_time) * 1000.0;
 
     static double print_timer = 0.0;
     print_timer += delta;
-    if (print_timer >= 1.0)
+    if (print_timer >= 5.0)
     {
-        //printf("%.2f cpu ms\n", true_cpu_ms);
-        print_timer -= 1.0;
+        double current_fps = 1000.0 / true_cpu_ms;
+        printf("%.2f cpu ms | %.1f FPS\n", true_cpu_ms, current_fps);
+        print_timer -= 5.0;
     }
 }
